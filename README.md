@@ -125,6 +125,12 @@ Superseded experiments `0002`, `0003`, and their `0006` reversion are
 intentionally absent. The optional Hopper FlashMLA patch is quarantined under
 [`patches/optional`](patches/optional) and is not part of the first DSpark run.
 
+Running on something other than H200? See
+[`docs/MULTI-ARCH.md`](docs/MULTI-ARCH.md) for per-architecture instructions and
+[`evidence/SM120-PREFLIGHT.md`](evidence/SM120-PREFLIGHT.md) for a measured sm_120
+capture showing the stock nightly container already carries sm_120 kernels (no
+source build required there).
+
 ## Prerequisites
 
 - Linux with three H200-class GPUs visible in one host;
