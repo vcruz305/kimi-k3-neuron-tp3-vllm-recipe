@@ -8,7 +8,7 @@ RECIPE_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 source "$RECIPE_ROOT/pins.env"
 
 [[ ${K3_ACK_DSPARK_UNVERIFIED:-0} == 1 ]] || {
-  echo "DSpark is not yet GPU-qualified. Set K3_ACK_DSPARK_UNVERIFIED=1 after reading the runbook." >&2
+  echo "DSpark is GPU-qualified on the reference 3xH200 build (see evidence/DSPARK-TP3-H200.md), but exact token-ID parity with target-only is NOT achievable on this quantized target. Set K3_ACK_DSPARK_UNVERIFIED=1 after reading the runbook's correctness section." >&2
   exit 1
 }
 
@@ -25,6 +25,13 @@ BIND_HOST=${BIND_HOST:-127.0.0.1}
 PORT=${PORT:-8008}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-k3-neuron-dspark}
 KV_CACHE_MEMORY_BYTES=${KV_CACHE_MEMORY_BYTES:-3221225472}
+# Workload-tuned; see "Choosing num_speculative_tokens" in
+# docs/INTEGRATED-RUNBOOK.md. Default is the qualified prose/general config;
+# set NUM_SPECULATIVE_TOKENS=3 and CUDAGRAPH_CAPTURE_SIZES=[1,4] together for
+# coding workloads. Never set NUM_SPECULATIVE_TOKENS=7 (the draft config's
+# own default) -- it is the measured worst point on this target's curve.
+NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-2}
+CUDAGRAPH_CAPTURE_SIZES=${CUDAGRAPH_CAPTURE_SIZES:-[1,3]}
 
 [[ -f "$TARGET_GGUF" ]] || { echo "missing GGUF: $TARGET_GGUF" >&2; exit 1; }
 [[ -d "$TARGET_TOKENIZER" ]] || { echo "missing tokenizer: $TARGET_TOKENIZER" >&2; exit 1; }
@@ -43,7 +50,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
 export VLLM_USE_BREAKABLE_CUDAGRAPH=1
 export VLLM_DFLASH_FULL_CUDAGRAPH_WITH_PIECEWISE_TARGET=1
 export DRAFT_MODEL SPEC_BACKEND DRAFT_SAMPLE_METHOD
-export REJECTION_SAMPLE_METHOD
+export REJECTION_SAMPLE_METHOD NUM_SPECULATIVE_TOKENS
 
 SPEC_CONFIG=$(python3 - <<'PY'
 import json
@@ -52,7 +59,7 @@ import os
 print(json.dumps({
     "model": os.environ["DRAFT_MODEL"],
     "method": "dspark",
-    "num_speculative_tokens": 7,
+    "num_speculative_tokens": int(os.environ["NUM_SPECULATIVE_TOKENS"]),
     "attention_backend": os.environ["SPEC_BACKEND"],
     "draft_sample_method": os.environ["DRAFT_SAMPLE_METHOD"],
     "rejection_sample_method": os.environ["REJECTION_SAMPLE_METHOD"],
@@ -82,7 +89,7 @@ exec python3 -m vllm.entrypoints.cli.main serve "$TARGET_GGUF" \
   --max-num-batched-tokens 64 \
   --dtype bfloat16 \
   --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES" \
-  --compilation-config '{"mode":0,"cudagraph_mode":"PIECEWISE","cudagraph_capture_sizes":[1,8],"cudagraph_num_of_warmups":1}' \
+  --compilation-config "{\"mode\":0,\"cudagraph_mode\":\"PIECEWISE\",\"cudagraph_capture_sizes\":${CUDAGRAPH_CAPTURE_SIZES},\"cudagraph_num_of_warmups\":1}" \
   --speculative-config "$SPEC_CONFIG" \
   --host "$BIND_HOST" \
   --port "$PORT" \

@@ -144,8 +144,9 @@ target-only GPU receipt used vLLM
 `0.26.1rc1.dev511+g700d39b55` with PyTorch `2.13.0+cu130` and NCCL `2.29.7`;
 the complete toolkit and driver versions were not captured. The public patch
 base is seven commits later and does not change the relevant K3/DSpark files.
-Clean patch application and source contracts are validated at the public base,
-while the integrated DSpark GPU run at that base remains pending.
+Clean patch application, source contracts, and the integrated DSpark GPU run
+are all validated at the public base -- see
+[`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md).
 
 ## Before you build
 
@@ -321,9 +322,12 @@ OOM, graph fallback, or draft-loader errors.
 ## Non-claims
 
 - This is not upstream vLLM support or an official vLLM image.
-- DSpark speed, acceptance, and graph replay are not yet GPU-proven here.
-- The 34.339 token/s result used target capture `[1]`, not the unmeasured
-  integrated target capture `[1,8]`.
+- DSpark speed, acceptance, and graph replay are GPU-measured on 3 x H200
+  (see [`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md)), but not
+  on any other architecture -- see the compatibility matrix.
+- The 34.339 token/s figure used target capture `[1]` only; the qualified
+  DSpark path separately measured target capture `[1,3]` (prose, N=2) and
+  `[1,4]` (coding, N=3).
 - Native K3 MXFP4/GB300 throughput does not transfer directly to IQ1_S/TP3
   H200.
 - This recipe does not redistribute weights, draft weights, or tokenizer

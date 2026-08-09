@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Print and validate the installed K3 vLLM overlay without reading secrets."""
+"""Print and validate the installed K3 vLLM overlay without reading secrets.
+
+The default JSON report is safe to paste into a public bug report: no
+tokens, no absolute filesystem paths (which can contain a username), no
+model files. Pass --show-install-paths to include the absolute vllm and
+vllm_gguf_plugin install paths for local debugging.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +29,15 @@ PIN_ROOT = Path(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--allow-no-gpu", action="store_true")
+    parser.add_argument(
+        "--show-install-paths",
+        action="store_true",
+        help=(
+            "Include absolute install paths for vllm and vllm_gguf_plugin. "
+            "These can contain a username; omit this flag for a report "
+            "meant to be pasted into a public bug report."
+        ),
+    )
     args = parser.parse_args()
 
     import torch
@@ -46,8 +61,8 @@ def main() -> None:
 
     report = {
         "vllm_version": vllm.__version__,
-        "vllm_path": inspect.getfile(vllm),
-        "gguf_plugin_path": inspect.getfile(vllm_gguf_plugin),
+        "vllm_importable": True,
+        "gguf_plugin_importable": True,
         "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
         "torch_nccl_version": (
@@ -63,6 +78,9 @@ def main() -> None:
         "kimi_linear_eagle3_bridge": True,
         "dspark_graph_resolver": True,
     }
+    if args.show_install_paths:
+        report["vllm_path"] = inspect.getfile(vllm)
+        report["gguf_plugin_path"] = inspect.getfile(vllm_gguf_plugin)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
