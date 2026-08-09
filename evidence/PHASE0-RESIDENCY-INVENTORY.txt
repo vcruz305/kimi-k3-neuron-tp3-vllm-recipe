@@ -1,0 +1,47 @@
+shards: 9   total tensor bytes: 330,160,710,016  (307.49 GiB)
+
+bucket                       GiB      %   tensors  dtypes
+routed_expert_ffn         247.63  80.5%       276  19
+attention_latent           19.37   6.3%       375  0,8
+other                      13.73   4.5%       812  0,8
+shared_expert_ffn          12.03   3.9%       276  8
+lm_head                    10.29   3.3%        94  1,8
+router                      2.20   0.7%       184  0
+token_embedding             2.19   0.7%         1  1
+kda                         0.04   0.0%       207  0
+norm                        0.01   0.0%       348  0
+
+ggml type                    GiB      %
+19                        247.63  80.5%
+8                          53.23  17.3%
+1                           4.38   1.4%
+0                           2.25   0.7%
+
+--- patch 0005 (dequantize latent projections to bf16) ---
+attention_latent on disk        : 19.37 GiB
+  if stored IQ1_S (~1.6b) -> bf16 : + 174.35 GiB total, + 58.12 GiB/rank TP3, + 43.59 GiB/rank TP4
+  if stored ~4b -> bf16           : +  58.12 GiB total, + 19.37 GiB/rank TP3, + 14.53 GiB/rank TP4
+  if stored ~8b -> bf16           : +  19.37 GiB total, +  6.46 GiB/rank TP3, +  4.84 GiB/rank TP4
+
+--- per-rank residency model (weights only) ---
+                         TP3         TP4
+sharded/N            101.76       76.32
++replicated            2.21        2.21
+= weights/rank       103.97       78.53
+
+measured H200 TP3 residency: 126.10 GiB/rank
+unexplained above weight model (TP3): 22.13 GiB/rank
+
+--- DGX Spark fit (128 GB = 119.2 GiB, ~110 GiB usable to the process) ---
+TP3: weights 103.97 GiB/rank -> headroom vs 110 GiB = +6.03 GiB TIGHT/NO
+TP4: weights 78.53 GiB/rank -> headroom vs 110 GiB = +31.47 GiB FITS
+
+--- k-scaling (expert FFN = 259.66 GiB, fixed = 47.83 GiB) ---
+     k   retain  total GiB  TP3 GiB/rk  TP4 GiB/rk
+   512    16.7%     134.38       46.27       35.25
+   768    25.0%     177.66       60.69       46.07
+  1024    33.3%     220.93       75.12       56.89
+  1280    41.7%     264.21       89.54       67.71
+  1536    50.0%     307.49      103.97       78.53
+  1792    58.3%     350.76      118.39       89.35
+  2048    66.7%     394.04      132.82      100.17
