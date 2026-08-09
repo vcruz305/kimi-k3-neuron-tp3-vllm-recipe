@@ -4,11 +4,20 @@ Patch recipe for serving the 330.2 GB Kimi-K3 Neuron IQ1_S GGUF through
 vLLM on three H200 GPUs, with breakable CUDA graphs and an experimental
 bridge to the released Kimi-K3 DSpark speculative draft.
 
-> **DSpark status: not yet GPU-qualified.** Target-only graph inference is
-> GPU-proven. The combined GGUF target + DSpark path is clean-apply and
-> CPU-contract validated, but its correctness, acceptance, memory, and speed
-> gates are still pending. The 39-69 token/s range is a planning range, not a
-> result.
+> **DSpark status: GPU-QUALIFIED (2026-08-09).** The combined GGUF target +
+> DSpark path now constructs, serves, and clears the 1.15x promotion gate on
+> 3 x H200: **42.464 token/s** single-stream at `num_speculative_tokens: 2`,
+> **1.218x** a contemporaneous target-only baseline of 34.875 token/s.
+> Full receipt: [`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md).
+>
+> **Set `num_speculative_tokens: 2`, not the draft config's default of 7.**
+> On this IQ1_S target, N=7 is the *worst* point on the curve (36.056 token/s);
+> speculative positions 5 and 6 contribute no measurable accepted tokens while
+> still costing about 8 ms per step.
+>
+> **Exact token-ID parity with target-only is not achievable on this model**,
+> and that is a property of quantization, not a bug — see the correctness
+> section of the receipt before writing any equality-based test.
 
 This is a **custom source overlay**, not an official vLLM release, a forked
 wheel, or a complete vLLM fork. It pins upstream source commits and carries the
@@ -39,7 +48,35 @@ The graph runs used capture size `[1]` only.
 | vLLM PIECEWISE graph, 3 serial reps x 64 output tokens | 30.092 token/s | GPU measured |
 | vLLM PIECEWISE graph, 3 serial reps x 256 output tokens | **34.339 token/s** | GPU measured |
 | llama.cpp target-only | about 20 token/s | approximate, non-contemporaneous reference |
-| vLLM graph + DSpark | **pending** | integrated `[1,8]` target and M=7 draft graphs unmeasured |
+| **vLLM graph + DSpark, N=2** | **42.464 token/s** | **GPU measured 2026-08-09** |
+
+## Measured DSpark performance
+
+Contemporaneous target-only baseline on the same build: **34.875 token/s**
+(reproduces the published `b85de5ba…` output hash exactly).
+
+| `num_speculative_tokens` | Sustained decode | vs target-only |
+|---:|---:|---:|
+| 1 | 39.113 token/s | 1.122x |
+| **2** | **42.464 token/s** | **1.218x** |
+| 3 | 41.325 token/s | 1.185x |
+| 5 | 40.028 token/s | 1.148x |
+| 7 (draft-config default) | 36.056 token/s | 1.034x |
+
+Aggregate throughput, DSpark N=2: **51.352 token/s** at batch 2, **76.857
+token/s** at batch 4. Target-only reaches **88.546 token/s** at batch 8.
+
+**Break-even rule.** Fitted cost is `step(N) ~= 37.2 + 5.95*N` ms against a
+28.67 ms standalone decode, so speculative position *i* pays only when its
+acceptance probability exceeds `5.95 / 28.67 = 0.2075`. Measured acceptance
+crosses that threshold between positions 2 and 3, which is exactly where the
+optimum was measured. Use this rule to retune N for any other quantization.
+
+Levers that measured as **null** on this target — recorded so they are not
+repeated: the optional Hopper FlashMLA draft patch (+1.4%), `probabilistic` +
+`block` sampling (untestable at temperature 0), `--async-scheduling` (+0.02%),
+target `cudagraph_mode: FULL` (refused by the KDA backend), and symmetric-memory
+all-reduce (unavailable at world size 3).
 
 The sealed France prompt returned token ID `17374` (` Paris`) in 3/3 runs.
 A stricter five-prompt cross-engine gate matched 4/5; the fifth prompt was a

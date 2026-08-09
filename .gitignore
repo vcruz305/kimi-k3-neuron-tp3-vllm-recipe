@@ -19,3 +19,6 @@ id_*
 .env
 .env.*
 !.env.example
+
+# agent runtime state
+.omc/
