@@ -78,6 +78,52 @@ sits. A marginal verified token costs only 21% of a standalone decode, so the
 batched verify is cheap: the binding constraint is draft acceptance, not
 verification cost.
 
+## Workload entropy is a first-class knob, and it moves the optimum
+
+Every number above used a single **prose explanation** prompt. Published DSpark
+on full-precision Kimi-K3 reports roughly **4.73 accepted tokens/step on
+low-entropy/coding** work against **2.61 on high-entropy** text, so the sweep
+above was tuned on the *worst* case for a draft.
+
+Re-measured with 5 coding prompts and 2 prose prompts, 256 tokens each,
+canonical single stream, temperature 0, seed 0:
+
+| N | **coding median** | coding mean | coding peak | mean accepted | emitted/step | prose median |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 49.273 | 48.184 | 49.78 | 1.490 | 2.490 | **41.092** |
+| **3** | **52.469** | **51.638** | **57.65** | 1.820 | 2.820 | 41.134 |
+| 4 | 43.196 | 46.839 | 55.36 | 2.019 | 3.019 | 38.688 |
+| 5 | 45.033 | 45.237 | 53.01 | 2.181 | 3.181 | 37.345 |
+
+N=3 re-run three times on a fresh server, 15 measurements total: medians
+**52.454 / 52.464 / 52.442**, spread **0.022 token/s (0.04%)**. Run-to-run is
+effectively deterministic at temperature 0 — acceptance is bit-identical across
+repetitions — so the visible spread between prompts is genuine workload
+variance, not measurement noise. Three of five coding prompts individually
+exceed 50 token/s; the slowest is 45.76.
+
+**The break-even rule derived from prose data predicted the coding optimum.**
+Marginal accepted tokens per added speculative position on coding: 2→3 gives
+**+0.33** (above the 0.2075 threshold, so N=3 beats N=2), 3→4 gives **+0.20**
+(at the threshold, so N=4 does not help), 4→5 gives **+0.16** (below it). The
+measured ranking matches.
+
+**Tune N to the workload — one setting does not serve both:**
+
+| workload | setting | result |
+|---|---|---:|
+| low-entropy / code | `num_speculative_tokens: 3`, capture `[1,4]` | **52.45 token/s** |
+| high-entropy / prose | `num_speculative_tokens: 2`, capture `[1,3]` | 42.46 token/s |
+
+N=3 on prose is 41.13, slightly *worse* than N=2's 42.46, so the choice is a
+real trade rather than a free win.
+
+Caveat on interpretation: the acceptance shortfall against full-precision K3
+(1.82 vs a published 4.73 accepted/step on coding) is real quantization loss and
+motivates distilling a draft against the compressed target. But a substantial
+part of the apparent shortfall in earlier sections was **workload choice**, not
+quantization.
+
 ## Levers that did nothing, and why
 
 Recorded so others do not repeat them.

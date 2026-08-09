@@ -10,10 +10,18 @@ bridge to the released Kimi-K3 DSpark speculative draft.
 > **1.218x** a contemporaneous target-only baseline of 34.875 token/s.
 > Full receipt: [`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md).
 >
-> **Set `num_speculative_tokens: 2`, not the draft config's default of 7.**
-> On this IQ1_S target, N=7 is the *worst* point on the curve (36.056 token/s);
-> speculative positions 5 and 6 contribute no measurable accepted tokens while
-> still costing about 8 ms per step.
+> **On coding workloads it reaches 52.454 token/s** at `num_speculative_tokens: 3`
+> (validated over 3 repetitions, spread 0.04%).
+>
+> **Tune `num_speculative_tokens` to the workload, and never leave it at the
+> draft config's default of 7** — on this IQ1_S target N=7 is the *worst* point
+> on the curve (36.056 token/s), because speculative positions 5 and 6
+> contribute no measurable accepted tokens while still costing ~8 ms per step.
+>
+> | workload | setting | result |
+> |---|---|---:|
+> | low-entropy / code | `num_speculative_tokens: 3`, capture `[1,4]` | **52.454 token/s** |
+> | high-entropy / prose | `num_speculative_tokens: 2`, capture `[1,3]` | 42.464 token/s |
 >
 > **Exact token-ID parity with target-only is not achievable on this model**,
 > and that is a property of quantization, not a bug — see the correctness
@@ -48,7 +56,8 @@ The graph runs used capture size `[1]` only.
 | vLLM PIECEWISE graph, 3 serial reps x 64 output tokens | 30.092 token/s | GPU measured |
 | vLLM PIECEWISE graph, 3 serial reps x 256 output tokens | **34.339 token/s** | GPU measured |
 | llama.cpp target-only | about 20 token/s | approximate, non-contemporaneous reference |
-| **vLLM graph + DSpark, N=2** | **42.464 token/s** | **GPU measured 2026-08-09** |
+| **vLLM graph + DSpark, N=2 (prose)** | **42.464 token/s** | **GPU measured 2026-08-09** |
+| **vLLM graph + DSpark, N=3 (coding)** | **52.454 token/s** | **GPU measured 2026-08-09** |
 
 ## Measured DSpark performance
 
@@ -65,6 +74,23 @@ Contemporaneous target-only baseline on the same build: **34.875 token/s**
 
 Aggregate throughput, DSpark N=2: **51.352 token/s** at batch 2, **76.857
 token/s** at batch 4. Target-only reaches **88.546 token/s** at batch 8.
+
+### Workload entropy moves the optimum
+
+The table above used a prose prompt. On coding prompts acceptance rises from
+0.547 to 0.744 and the optimum shifts from N=2 to N=3:
+
+| N | coding median | prose median |
+|---:|---:|---:|
+| 2 | 49.273 | **42.464** |
+| **3** | **52.454** | 41.134 |
+| 4 | 43.196 | 38.688 |
+| 5 | 45.033 | 37.345 |
+
+N=3 validated over 3 repetitions (15 measurements): 52.454 / 52.464 / 52.442,
+spread 0.022 token/s. The break-even rule predicted this from prose data —
+marginal accepted per added position on coding is +0.33 (2→3, pays), +0.20
+(3→4, at threshold), +0.16 (4→5, does not pay).
 
 **Break-even rule.** Fitted cost is `step(N) ~= 37.2 + 5.95*N` ms against a
 28.67 ms standalone decode, so speculative position *i* pays only when its
