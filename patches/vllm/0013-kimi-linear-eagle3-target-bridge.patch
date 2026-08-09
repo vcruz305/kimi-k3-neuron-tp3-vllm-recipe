@@ -1,0 +1,18 @@
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index 68e134d..12f7b6f 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -1431,7 +1431,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+ 
+ 
+ class KimiLinearForCausalLM(
+-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
++    nn.Module,
++    HasInnerState,
++    SupportsPP,
++    MixtureOfExperts,
++    SupportsEagle3,
++    IsHybrid,
+ ):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()

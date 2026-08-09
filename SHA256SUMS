@@ -1,0 +1,13 @@
+43fe8f307395576557a3d04b884ad2144452a72682ef407aacd6009dcc70e0c5  config/config.json
+d783a7b8d6b82f666a6e5ae544411128f06ccfddf7674a45ae7b5f190f00a686  patches/gguf-plugin/0001-feat-add-Kimi-K3-Neuron-GGUF-adapter.patch
+aaba97b4dba840b5d4fe7d2b122e1c4283c64d353f80fb3047fc51f5f55c71ad  patches/gguf-plugin/0005-fix-kimi-k3-dequantize-latent-projections-for-native.patch
+fe18d63def34be683438866f0cbdf963e2722feace76b6f04acce5b15600b8c8  patches/gguf-plugin/0007-fix-moe-guard-CUDA-vector-grid-z-limit.patch
+309490d6e056f30380e32ea0ea018c61815c5356d6eac95edcd51f8f96bcae62  patches/gguf-plugin/0009-fix-honor-distributed-TP-rank-in-GGUF-fused-loaders.patch
+bddcbd542b8611622ef9650530f2f8a330c4b3fa00a9b099bde2f4e3abe4ae60  patches/optional/0011-hopper-flashmla-noncausal-dspark.patch
+9fa6522b48e750b9cd498a4cb096e377a8349033f5f2349d99cbda0b14f8ff72  patches/vllm/0004-fix-kimi-k3-pad-vocabulary-for-odd-TP-sizes.patch
+e5a03873b742391129f09960468569a73a16f4a4d85164ea026a684cf0e287ee  patches/vllm/0008-fix-kimi-k3-preserve-precision-sensitive-GGUF-weight.patch
+6adc64c61bcc4963fdeb8624032b254533e1c18279b44355b4051778ebb9d1ae  patches/vllm/0010-kimi-k3-dspark-gguf-target-tp3.patch
+a2c53bd1b0b28867fddb925c436bfa6c520fe2ccc8945614afef92cc45634d6f  patches/vllm/0012-dspark-draft-config-format-isolation.patch
+5e3df573089e4eedce5f506872d0c267385fc0e6f15c77ca65fa2efcdb4c442d  patches/vllm/0013-kimi-linear-eagle3-target-bridge.patch
+ea8e945e03663d012c21938d99c1fe8bc499a4d1a2d479762b831df7d96dbed5  patches/vllm/0014-dflash-full-cg-with-piecewise-target.patch
+ca384197f18206978e5eeeb6d621803422a31b6dd0fbfbf3aa9aa699a3d0ab1a  pins.env

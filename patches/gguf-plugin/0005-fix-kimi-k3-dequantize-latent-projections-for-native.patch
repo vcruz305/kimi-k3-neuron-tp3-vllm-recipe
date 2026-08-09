@@ -1,0 +1,159 @@
+From 6760261145841f4e51243a363919c8041df5c8b8 Mon Sep 17 00:00:00 2001
+From: Codex K3 Adapter <codex-k3@localhost>
+Date: Sat, 8 Aug 2026 15:25:00 -0700
+Subject: [PATCH] fix(kimi-k3): dequantize latent projections for native runner
+
+---
+ tests/test_kimi_k3_adapter.py               | 46 +++++++++++++++++++++
+ vllm_gguf_plugin/weights_adapter/kimi_k3.py | 29 +++++++++++--
+ 2 files changed, 71 insertions(+), 4 deletions(-)
+
+diff --git a/tests/test_kimi_k3_adapter.py b/tests/test_kimi_k3_adapter.py
+index ed4e0bb..29eb90b 100644
+--- a/tests/test_kimi_k3_adapter.py
++++ b/tests/test_kimi_k3_adapter.py
+@@ -31,6 +31,10 @@ def test_kimi_k3_static_name_map_covers_special_paths():
+     assert mapping["blk.0.ssm_g.weight"] == "model.layers.0.self_attn.g_proj.weight"
+     assert mapping["blk.0.ssm_a"] == "model.layers.0.self_attn.A_log"
+     assert mapping["blk.1.attn_k_b.weight"] == "__k3_kvb__.1.k.weight"
++    assert mapping["blk.1.ffn_routed_down.weight"] == (
++        "__k3_routed__.1.down.weight"
++    )
++    assert mapping["blk.1.ffn_routed_up.weight"] == "__k3_routed__.1.up.weight"
+     assert mapping["blk.1.ffn_gate_exps.weight"].endswith(
+         ".block_sparse_moe.experts.0.w1.weight"
+     )
+@@ -60,11 +64,24 @@ def test_kimi_k3_inverse_transforms(monkeypatch):
+             "model.layers.1.block_sparse_moe.experts.0.w1.weight",
+             torch.arange(24.0).reshape(2, 3, 4),
+         ),
++        ("__k3_routed__.1.down.qweight_type", torch.tensor(8)),
++        ("__k3_routed__.1.down.qweight", torch.ones((3, 4), dtype=torch.uint8)),
+     ]
+     monkeypatch.setattr(
+         "vllm_gguf_plugin.weights_adapter.kimi_k3.gguf_quant_weights_iterator_multi",
+         lambda *_args, **_kwargs: iter(fake_weights),
+     )
++    dequant_calls = []
++
++    def fake_dequantize(weight, qtype):
++        dequant_calls.append((weight.shape, qtype))
++        if qtype is not None:
++            return torch.full((3, 8), 7.0)
++        return weight.float()
++
++    monkeypatch.setattr(
++        "vllm_gguf_plugin.weights_adapter.kimi_k3._dequantize", fake_dequantize
++    )
+ 
+     loaded = list(adapter.prepare_weights(None))
+     by_name = {name: weight for name, weight in loaded}
+@@ -76,6 +93,35 @@ def test_kimi_k3_inverse_transforms(monkeypatch):
+     assert by_name["model.layers.0.self_attn.q_conv1d.weight"].shape == (8, 1, 4)
+     assert by_name["model.layers.1.self_attn.kv_b_proj.weight"].shape == (12, 4)
+     assert "model.layers.1.block_sparse_moe.experts.1.w1.weight" in by_name
++    routed = (
++        "model.layers.1.block_sparse_moe.routed_expert_down_proj.weight"
++    )
++    assert by_name[routed].shape == (3, 8)
++    assert by_name[routed].dtype == torch.bfloat16
++    assert dequant_calls[-1] == (torch.Size([3, 4]), 8)
++
++
++def test_kimi_k3_routes_latent_projections_to_dense_modules(monkeypatch):
++    config = _config()
++    adapter = KimiK3NeuronGGUFAdapter(config)
++    monkeypatch.setattr(adapter, "patch_hf_config", lambda _path, cfg: cfg)
++    monkeypatch.setattr(adapter, "_get_all_gguf_files", lambda _path: ["unused.gguf"])
++    monkeypatch.setattr(
++        "vllm_gguf_plugin.weights_adapter.kimi_k3.get_gguf_weight_type_map",
++        lambda *_args: {},
++    )
++    model_config = SimpleNamespace(hf_config=config)
++
++    spec = adapter.prepare_loading("unused.gguf", model_config)
++
++    assert (
++        "model.layers.1.block_sparse_moe.routed_expert_down_proj"
++        in spec.unquantized_modules
++    )
++    assert (
++        "model.layers.1.block_sparse_moe.routed_expert_up_proj"
++        in spec.unquantized_modules
++    )
+ 
+ 
+ def test_situ_beta_plumbing_preserves_k3_values():
+diff --git a/vllm_gguf_plugin/weights_adapter/kimi_k3.py b/vllm_gguf_plugin/weights_adapter/kimi_k3.py
+index 55d0781..bbfe084 100644
+--- a/vllm_gguf_plugin/weights_adapter/kimi_k3.py
++++ b/vllm_gguf_plugin/weights_adapter/kimi_k3.py
+@@ -32,6 +32,9 @@ if TYPE_CHECKING:
+ 
+ _CONV_RE = re.compile(r"^__k3_conv__\.(\d+)\.([qkv])\.(weight|qweight|qweight_type)$")
+ _KVB_RE = re.compile(r"^__k3_kvb__\.(\d+)\.([kv])\.(weight|qweight|qweight_type)$")
++_ROUTED_RE = re.compile(
++    r"^__k3_routed__\.(\d+)\.(down|up)\.(weight|qweight|qweight_type)$"
++)
+ 
+ 
+ def _field_scalar(reader: gguf.GGUFReader, name: str):
+@@ -173,10 +176,10 @@ class KimiK3NeuronGGUFAdapter(BaseGGUFWeightsAdapter):
+                     f"{gg}.ffn_down_exps.weight": f"{moe}.experts.0.w2.weight",
+                     f"{gg}.ffn_up_exps.weight": f"{moe}.experts.0.w3.weight",
+                     f"{gg}.ffn_routed_down.weight": (
+-                        f"{moe}.routed_expert_down_proj.weight"
++                        f"__k3_routed__.{i}.down.weight"
+                     ),
+                     f"{gg}.ffn_routed_up.weight": (
+-                        f"{moe}.routed_expert_up_proj.weight"
++                        f"__k3_routed__.{i}.up.weight"
+                     ),
+                     f"{gg}.ffn_routed_norm.weight": (
+                         f"{moe}.routed_expert_norm.weight"
+@@ -227,6 +230,13 @@ class KimiK3NeuronGGUFAdapter(BaseGGUFWeightsAdapter):
+                 model_config.hf_config.linear_attn_config["kda_layers"]
+             ):
+                 unquantized.add(f"model.layers.{i}.self_attn.kv_b_proj")
++            if i >= int(model_config.hf_config.first_k_dense_replace):
++                moe = f"model.layers.{i}.block_sparse_moe"
++                # Native K3's latent-MoE runner directly consumes these dense
++                # replicated projections.  Keep that stock, fused path and
++                # dequantize the two Q8_0 GGUF tensors once during loading.
++                unquantized.add(f"{moe}.routed_expert_down_proj")
++                unquantized.add(f"{moe}.routed_expert_up_proj")
+ 
+         self.load_spec = GGUFLoadSpec(
+             weights_source=files,
+@@ -264,8 +274,9 @@ class KimiK3NeuronGGUFAdapter(BaseGGUFWeightsAdapter):
+         for name, weight in weights:
+             conv_match = _CONV_RE.match(name)
+             kvb_match = _KVB_RE.match(name)
+-            if conv_match or kvb_match:
+-                match = conv_match or kvb_match
++            routed_match = _ROUTED_RE.match(name)
++            if conv_match or kvb_match or routed_match:
++                match = conv_match or kvb_match or routed_match
+                 assert match is not None
+                 kind = match.group(3)
+                 key = name.rsplit(".", 1)[0]
+@@ -286,6 +297,16 @@ class KimiK3NeuronGGUFAdapter(BaseGGUFWeightsAdapter):
+                     )
+                     continue
+ 
++                if routed_match:
++                    layer = int(routed_match.group(1))
++                    part = routed_match.group(2)
++                    yield (
++                        "model.layers."
++                        f"{layer}.block_sparse_moe.routed_expert_{part}_proj.weight",
++                        value.to(torch.bfloat16),
++                    )
++                    continue
++
+                 layer, part = int(kvb_match.group(1)), kvb_match.group(2)
+                 kv_parts.setdefault(layer, {})[part] = value
+                 if set(kv_parts[layer]) == {"k", "v"}:
+-- 
+2.52.0.windows.1
+

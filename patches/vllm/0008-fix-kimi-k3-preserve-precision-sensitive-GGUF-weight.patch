@@ -1,0 +1,51 @@
+From 1fc619406ff928b3199b6b1959242cfe5df7ce76 Mon Sep 17 00:00:00 2001
+From: Codex K3 Adapter <codex-k3@localhost>
+Date: Sat, 8 Aug 2026 15:57:55 -0700
+Subject: [PATCH] fix(kimi-k3): preserve precision-sensitive GGUF weights
+
+Store router and attention-residual projection parameters in FP32 so loading Kimi-K3 GGUF tensors does not silently downcast checkpoint values.
+
+Co-authored-by: OpenAI Codex <noreply@openai.com>
+---
+ vllm/models/kimi_k3/nvidia/model.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index 2d06495..d461480 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -528,6 +528,7 @@ class KimiMoE(nn.Module):
+             output_size=num_experts,
+             bias=False,
+             out_dtype=torch.float32,
++            params_dtype=torch.float32,
+             prefix=f"{prefix}.gate",
+         )
+ 
+@@ -883,6 +884,7 @@ class KimiDecoderLayer(nn.Module):
+                 config.hidden_size,
+                 1,
+                 bias=False,
++                params_dtype=torch.float32,
+                 quant_config=None,
+                 prefix=f"{prefix}.self_attention_res_proj",
+             )
+@@ -890,6 +892,7 @@ class KimiDecoderLayer(nn.Module):
+                 config.hidden_size,
+                 1,
+                 bias=False,
++                params_dtype=torch.float32,
+                 quant_config=None,
+                 prefix=f"{prefix}.mlp_res_proj",
+             )
+@@ -1088,6 +1091,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+                     config.hidden_size,
+                     1,
+                     bias=False,
++                    params_dtype=torch.float32,
+                     quant_config=None,
+                     prefix=f"{prefix}.output_attn_res_proj",
+                 )
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,99 @@
+From 39837e9b1d73b7a398a04ec3a205f8906e10beb4 Mon Sep 17 00:00:00 2001
+From: Codex K3 Adapter <codex-k3@localhost>
+Date: Sat, 8 Aug 2026 15:19:57 -0700
+Subject: [PATCH] fix(kimi-k3): pad vocabulary for odd TP sizes
+
+---
+ .../test_vocab_parallel_embedding_odd_tp.py   | 38 +++++++++++++++++++
+ vllm/models/kimi_k3/nvidia/model.py           | 11 ++++++
+ 2 files changed, 49 insertions(+)
+ create mode 100644 tests/model_executor/layers/test_vocab_parallel_embedding_odd_tp.py
+
+diff --git a/tests/model_executor/layers/test_vocab_parallel_embedding_odd_tp.py b/tests/model_executor/layers/test_vocab_parallel_embedding_odd_tp.py
+new file mode 100644
+index 0000000..537ccbb
+--- /dev/null
++++ b/tests/model_executor/layers/test_vocab_parallel_embedding_odd_tp.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import pytest
++
++import vllm.model_executor.layers.vocab_parallel_embedding as vocab_module
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++
++
++@pytest.mark.parametrize("layer_cls", [VocabParallelEmbedding, ParallelLMHead])
++@pytest.mark.parametrize(
++    ("tp_rank", "num_real_rows", "num_padding_rows"),
++    [(0, 54_656, 0), (1, 54_656, 0), (2, 54_528, 128)],
++)
++def test_explicit_lcm_vocab_padding_supports_tp3(
++    monkeypatch, layer_cls, tp_rank, num_real_rows, num_padding_rows
++):
++    monkeypatch.setattr(
++        vocab_module, "get_tensor_model_parallel_rank", lambda: tp_rank
++    )
++    monkeypatch.setattr(
++        vocab_module, "get_tensor_model_parallel_world_size", lambda: 3
++    )
++
++    layer = layer_cls(
++        num_embeddings=163_840,
++        embedding_dim=8,
++        padding_size=192,
++    )
++
++    assert layer.padding_size == 192
++    assert layer.num_embeddings_padded == 163_968
++    assert layer.num_embeddings_per_partition == 54_656
++    assert layer.shard_indices.num_org_elements == num_real_rows
++    assert layer.shard_indices.num_org_vocab_padding == num_padding_rows
++    assert layer.shard_indices.num_elements_padded == 54_656
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index 5933f56..2db1330 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -51,6 +51,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors import (
+     compressed_tensors,
+ )
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
++    DEFAULT_VOCAB_PADDING_SIZE,
+     ParallelLMHead,
+     VocabParallelEmbedding,
+ )
+@@ -1044,11 +1045,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+         )
+ 
+         self.vocab_size = config.vocab_size
++        # The native K3 vocabulary is already a multiple of the default
++        # 64-token padding, but not of TP3.  Include TP size in the padding
++        # quantum so VocabParallelEmbedding can divide the padded rows evenly
++        # while retaining config.vocab_size as the original logits boundary.
++        self.vocab_padding_size = math.lcm(
++            DEFAULT_VOCAB_PADDING_SIZE,
++            parallel_config.tensor_parallel_size,
++        )
+ 
+         if get_pp_group().is_first_rank:
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+                 config.hidden_size,
++                padding_size=self.vocab_padding_size,
+                 prefix=f"{prefix}.embed_tokens",
+             )
+         else:
+@@ -1420,6 +1430,7 @@ class KimiLinearForCausalLM(
+             self.lm_head = ParallelLMHead(
+                 self.config.vocab_size,
+                 self.config.hidden_size,
++                padding_size=self.model.vocab_padding_size,
+                 quant_config=quant_config,
+                 prefix=maybe_prefix(prefix, "lm_head"),
+             )
+-- 
+2.52.0.windows.1
+

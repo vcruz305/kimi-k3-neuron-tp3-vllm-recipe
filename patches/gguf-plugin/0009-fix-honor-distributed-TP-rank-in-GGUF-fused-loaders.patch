@@ -1,0 +1,101 @@
+From c27e6a58f52c3d33021f2ff9e202fb5108ecfbc8 Mon Sep 17 00:00:00 2001
+From: Codex K3 Adapter <codex-k3@localhost>
+Date: Sat, 8 Aug 2026 16:01:16 -0700
+Subject: [PATCH] fix: honor distributed TP rank in GGUF fused loaders
+
+Merged-column and QKV weight-loader v2 calls do not pass tp_rank. Resolve the active distributed rank instead of silently selecting rank zero on every worker.
+
+Co-authored-by: OpenAI Codex <noreply@openai.com>
+---
+ tests/test_kimi_k3_adapter.py           | 48 +++++++++++++++++++++++++
+ vllm_gguf_plugin/quantization/params.py |  4 +--
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test_kimi_k3_adapter.py b/tests/test_kimi_k3_adapter.py
+index 29eb90b..76c9be3 100644
+--- a/tests/test_kimi_k3_adapter.py
++++ b/tests/test_kimi_k3_adapter.py
+@@ -5,6 +5,7 @@ from types import SimpleNamespace
+ import torch
+ 
+ from vllm_gguf_plugin.quantization.fused_moe import _situ_activation_config
++from vllm_gguf_plugin.quantization.params import _GGUFParamLoadMixin
+ from vllm_gguf_plugin.weights_adapter.base import GGUFLoadSpec
+ from vllm_gguf_plugin.weights_adapter.kimi_k3 import KimiK3NeuronGGUFAdapter
+ 
+@@ -131,3 +132,50 @@ def test_situ_beta_plumbing_preserves_k3_values():
+     unset = _situ_activation_config(-1.0, -1.0)
+     assert unset.activation_situ_beta is None
+     assert unset.activation_situ_linear_beta is None
++
++
++def test_merged_gguf_loader_uses_distributed_tp_rank(monkeypatch):
++    class CaptureParam(_GGUFParamLoadMixin):
++        def _store(self, loaded_weight, shard_id=None):
++            self.loaded = loaded_weight.clone()
++            self.loaded_shard_id = shard_id
++
++    monkeypatch.setattr(
++        "vllm_gguf_plugin.quantization.params.get_tensor_model_parallel_rank",
++        lambda: 2,
++    )
++    param = CaptureParam()
++    weight = torch.arange(18).reshape(9, 2)
++
++    param.load_merged_column_weight(
++        weight,
++        shard_id=3,
++        shard_offset=0,
++        shard_size=3,
++    )
++
++    assert torch.equal(param.loaded, weight[6:9])
++    assert param.loaded_shard_id == 3
++
++
++def test_qkv_gguf_loader_uses_distributed_tp_rank(monkeypatch):
++    class CaptureParam(_GGUFParamLoadMixin):
++        def _store(self, loaded_weight, shard_id=None):
++            self.loaded = loaded_weight.clone()
++            self.loaded_shard_id = shard_id
++
++    monkeypatch.setattr(
++        "vllm_gguf_plugin.quantization.params.get_tensor_model_parallel_rank",
++        lambda: 1,
++    )
++    param = CaptureParam()
++    weight = torch.arange(24).reshape(12, 2)
++
++    param.load_qkv_weight(
++        weight,
++        shard_id="q",
++        shard_size=4,
++    )
++
++    assert torch.equal(param.loaded, weight[4:8])
++    assert param.loaded_shard_id == "q"
+diff --git a/vllm_gguf_plugin/quantization/params.py b/vllm_gguf_plugin/quantization/params.py
+index 841b94c..0bafc71 100644
+--- a/vllm_gguf_plugin/quantization/params.py
++++ b/vllm_gguf_plugin/quantization/params.py
+@@ -243,7 +243,7 @@ class _GGUFParamLoadMixin:
+ 
+     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+         shard_id = kwargs.get("shard_id")
+-        tp_rank = kwargs.get("tp_rank", 0)
++        tp_rank = kwargs.get("tp_rank", get_tensor_model_parallel_rank())
+         shard_size = kwargs.get("shard_size")
+         if (
+             shard_size is not None
+@@ -256,7 +256,7 @@ class _GGUFParamLoadMixin:
+ 
+     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
+         shard_id = kwargs.get("shard_id")
+-        tp_rank = kwargs.get("tp_rank", 0)
++        tp_rank = kwargs.get("tp_rank", get_tensor_model_parallel_rank())
+         shard_size = kwargs.get("shard_size")
+         num_kv_head_replicas = kwargs.get("num_heads", 1)
+         if (
+-- 
+2.52.0.windows.1
+

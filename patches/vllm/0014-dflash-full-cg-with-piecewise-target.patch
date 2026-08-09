@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: K3 Neuron evaluation <noreply@local>
+Date: Sat, 8 Aug 2026 23:55:00 -0700
+Subject: [PATCH] perf(spec-decode): allow full draft graph with piecewise target
+
+Kimi K3's target model uses breakable PIECEWISE CUDA graphs, while the
+DFlash/DSpark draft has a fixed uniform query shape and can use a FULL graph.
+The existing code derives the draft mode solely from the target decode mode,
+which silently leaves the draft eager whenever the target is PIECEWISE.
+
+Add a narrowly scoped, opt-in escape hatch. It only changes a PIECEWISE target;
+NONE still means eager, so `enforce_eager` remains authoritative. Full draft
+capture is also still gated by the draft attention backend's own support.
+
+Enable with:
+
+    VLLM_DFLASH_FULL_CUDAGRAPH_WITH_PIECEWISE_TARGET=1
+
+This is intentionally opt-in because a separate full draft graph consumes
+additional graph-pool memory.
+---
+ .../gpu/spec_decode/dflash/speculator.py      | 44 ++++++++++++++++++----
+ .../spec_decode/test_dflash_cudagraph_mode.py | 42 +++++++++++++++++++++
+ 2 files changed, 78 insertions(+), 8 deletions(-)
+ create mode 100644 tests/v1/spec_decode/test_dflash_cudagraph_mode.py
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 3336486..2b784ef 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from collections.abc import Mapping
+ from typing import Any
+ 
+@@ -29,6 +30,26 @@ from vllm.v1.worker.utils import AttentionGroup
+ logger = init_logger(__name__)
+ 
+ 
++def _resolve_dflash_cudagraph_mode(
++    target_mode: CUDAGraphMode,
++    supports_full: bool,
++    enable_full_with_piecewise_target: bool,
++) -> CUDAGraphMode:
++    """Resolve the independent DFlash/DSpark draft graph mode.
++
++    A fixed-shape parallel draft can use a FULL graph even when a target with
++    eager capture boundaries uses a breakable PIECEWISE graph. NONE remains
++    authoritative so this opt-in never defeats target ``enforce_eager``.
++    """
++    wants_full = target_mode.decode_mode() == CUDAGraphMode.FULL or (
++        target_mode == CUDAGraphMode.PIECEWISE
++        and enable_full_with_piecewise_target
++    )
++    if wants_full and supports_full:
++        return CUDAGraphMode.FULL_DECODE_ONLY
++    return CUDAGraphMode.NONE
++
++
+ class DFlashSpeculator(DraftModelSpeculator):
+     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
+ 
+@@ -108,11 +129,23 @@ class DFlashSpeculator(DraftModelSpeculator):
+         )
+ 
+     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+-        wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+         supports_full = (
+             self.attn_cg_support.min_cg_support.value
+             >= AttentionCGSupport.UNIFORM_BATCH.value
+         )
++        enable_full_with_piecewise_target = os.getenv(
++            "VLLM_DFLASH_FULL_CUDAGRAPH_WITH_PIECEWISE_TARGET", "0"
++        ) == "1"
++        requested_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL or (
++            cudagraph_mode == CUDAGraphMode.PIECEWISE
++            and enable_full_with_piecewise_target
++        )
++        draft_cudagraph_mode = _resolve_dflash_cudagraph_mode(
++            cudagraph_mode,
++            supports_full,
++            enable_full_with_piecewise_target,
++        )
++
+-        if wants_full and not supports_full:
++        if requested_full and not supports_full:
+             logger.warning(
+                 "%s draft attention (%s) does not support full CUDA graphs; "
+@@ -120,14 +153,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 self.attn_cg_support.min_cg_attn_backend,
+             )
+         # PIECEWISE cudagraphs are not supported for dflash.
+-        if wants_full and supports_full:
+-            cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+-        else:
+-            cudagraph_mode = CUDAGraphMode.NONE
+-
+         self.query_cudagraph_manager = DFlashCudaGraphManager(
+             self.vllm_config,
+             self.device,
+-            cudagraph_mode,
++            draft_cudagraph_mode,
+             decode_query_len=self.num_query_per_req,
+         )
+diff --git a/tests/v1/spec_decode/test_dflash_cudagraph_mode.py b/tests/v1/spec_decode/test_dflash_cudagraph_mode.py
+new file mode 100644
+index 0000000..4059b1e
+--- /dev/null
++++ b/tests/v1/spec_decode/test_dflash_cudagraph_mode.py
+@@ -0,0 +1,42 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++
++from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
++    _resolve_dflash_cudagraph_mode,
++)
++
++
++@pytest.mark.parametrize(
++    "target_mode,supports_full,opt_in,expected",
++    [
++        (
++            CUDAGraphMode.PIECEWISE,
++            True,
++            True,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        ),
++        (CUDAGraphMode.PIECEWISE, True, False, CUDAGraphMode.NONE),
++        (CUDAGraphMode.PIECEWISE, False, True, CUDAGraphMode.NONE),
++        (
++            CUDAGraphMode.FULL_AND_PIECEWISE,
++            True,
++            False,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        ),
++        (
++            CUDAGraphMode.FULL_DECODE_ONLY,
++            True,
++            False,
++            CUDAGraphMode.FULL_DECODE_ONLY,
++        ),
++        # An opt-in must never override enforce_eager / target NONE.
++        (CUDAGraphMode.NONE, True, True, CUDAGraphMode.NONE),
++    ],
++)
++def test_resolve_dflash_cudagraph_mode(
++    target_mode, supports_full, opt_in, expected
++):
++    assert _resolve_dflash_cudagraph_mode(target_mode, supports_full, opt_in) == expected
+-- 
+2.51.0

@@ -1,0 +1,36 @@
+name: recipe-contracts
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bundle audit
+        run: python3 scripts/check_bundle.py
+      - name: Python syntax
+        run: python3 -m compileall -q scripts tests
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh
+      - name: Diff hygiene
+        run: git diff --check -- . ':(exclude)patches/**/*.patch'
+  clean-apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Clone pins, apply patches, and run contracts
+        run: scripts/prepare_sources.sh /tmp/k3-sources

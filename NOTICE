@@ -1,0 +1,10 @@
+Kimi-K3 Neuron TP3 vLLM Recipe
+Copyright 2026 Victor Cruz
+
+This distribution contains patch files derived from or intended for the
+Apache-2.0-licensed vLLM and vLLM GGUF plugin projects. It does not contain
+their complete source distributions or any model checkpoint weights.
+
+Kimi-K3, the Kimi-K3 tokenizer, the Kimi-K3 Neuron GGUF, and the Inferact
+DSpark draft are separate artifacts governed by the terms linked in
+THIRD_PARTY_NOTICES.md.

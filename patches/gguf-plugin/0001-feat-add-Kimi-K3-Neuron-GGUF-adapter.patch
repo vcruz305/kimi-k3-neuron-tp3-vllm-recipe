@@ -1,0 +1,583 @@
+From 6eb20a8e9011082276822321c346f0c22368b730 Mon Sep 17 00:00:00 2001
+From: Codex K3 Adapter <codex-k3@localhost>
+Date: Sat, 8 Aug 2026 15:04:37 -0700
+Subject: [PATCH] feat: add Kimi K3 Neuron GGUF adapter
+
+---
+ tests/test_kimi_k3_adapter.py                |  87 +++++
+ vllm_gguf_plugin/config_parser.py            |  16 +-
+ vllm_gguf_plugin/quantization/fused_moe.py   |  47 ++-
+ vllm_gguf_plugin/weights_adapter/__init__.py |   3 +
+ vllm_gguf_plugin/weights_adapter/kimi_k3.py  | 323 +++++++++++++++++++
+ 5 files changed, 471 insertions(+), 5 deletions(-)
+ create mode 100644 tests/test_kimi_k3_adapter.py
+ create mode 100644 vllm_gguf_plugin/weights_adapter/kimi_k3.py
+
+diff --git a/tests/test_kimi_k3_adapter.py b/tests/test_kimi_k3_adapter.py
+new file mode 100644
+index 0000000..ed4e0bb
+--- /dev/null
++++ b/tests/test_kimi_k3_adapter.py
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from types import SimpleNamespace
++
++import torch
++
++from vllm_gguf_plugin.quantization.fused_moe import _situ_activation_config
++from vllm_gguf_plugin.weights_adapter.base import GGUFLoadSpec
++from vllm_gguf_plugin.weights_adapter.kimi_k3 import KimiK3NeuronGGUFAdapter
++
++
++class _Config(SimpleNamespace):
++    def get_text_config(self):
++        return self
++
++
++def _config():
++    return _Config(
++        model_type="kimi_linear",
++        num_hidden_layers=2,
++        first_k_dense_replace=1,
++        linear_attn_config={"kda_layers": [1], "full_attn_layers": [2]},
++        attn_res_block_size=12,
++        routed_expert_hidden_size=3584,
++        hidden_act="situ",
++    )
++
++
++def test_kimi_k3_static_name_map_covers_special_paths():
++    mapping = KimiK3NeuronGGUFAdapter.build_name_map(_config())
++    assert mapping["blk.0.ssm_g.weight"] == "model.layers.0.self_attn.g_proj.weight"
++    assert mapping["blk.0.ssm_a"] == "model.layers.0.self_attn.A_log"
++    assert mapping["blk.1.attn_k_b.weight"] == "__k3_kvb__.1.k.weight"
++    assert mapping["blk.1.ffn_gate_exps.weight"].endswith(
++        ".block_sparse_moe.experts.0.w1.weight"
++    )
++    assert mapping["blk.1.ffn_down_exps.weight"].endswith(
++        ".block_sparse_moe.experts.0.w2.weight"
++    )
++    assert mapping["blk.1.ffn_up_exps.weight"].endswith(
++        ".block_sparse_moe.experts.0.w3.weight"
++    )
++
++
++def test_kimi_k3_inverse_transforms(monkeypatch):
++    adapter = KimiK3NeuronGGUFAdapter(_config())
++    adapter.load_spec = GGUFLoadSpec(
++        weights_source=["unused.gguf"],
++        gguf_to_hf_name_map={},
++        unquantized_modules=[],
++    )
++    stored_a = -torch.exp(torch.tensor([0.25, -0.5]))
++    fake_weights = [
++        ("model.layers.0.self_attention_res_proj.weight", torch.tensor([2.0, 3.0])),
++        ("model.layers.0.self_attn.A_log", stored_a),
++        ("__k3_conv__.0.q.weight", torch.arange(32.0).reshape(1, 8, 1, 4)),
++        ("__k3_kvb__.1.k.weight", torch.arange(24.0).reshape(2, 4, 3)),
++        ("__k3_kvb__.1.v.weight", torch.arange(24.0).reshape(2, 3, 4)),
++        (
++            "model.layers.1.block_sparse_moe.experts.0.w1.weight",
++            torch.arange(24.0).reshape(2, 3, 4),
++        ),
++    ]
++    monkeypatch.setattr(
++        "vllm_gguf_plugin.weights_adapter.kimi_k3.gguf_quant_weights_iterator_multi",
++        lambda *_args, **_kwargs: iter(fake_weights),
++    )
++
++    loaded = list(adapter.prepare_weights(None))
++    by_name = {name: weight for name, weight in loaded}
++    assert torch.equal(
++        by_name["model.layers.0.self_attention_res_norm.weight"], torch.ones(2)
++    )
++    assert by_name["model.layers.0.self_attention_res_proj.weight"].shape == (1, 2)
++    assert torch.allclose(by_name["model.layers.0.self_attn.A_log"], torch.tensor([0.25, -0.5]))
++    assert by_name["model.layers.0.self_attn.q_conv1d.weight"].shape == (8, 1, 4)
++    assert by_name["model.layers.1.self_attn.kv_b_proj.weight"].shape == (12, 4)
++    assert "model.layers.1.block_sparse_moe.experts.1.w1.weight" in by_name
++
++
++def test_situ_beta_plumbing_preserves_k3_values():
++    config = _situ_activation_config(4.0, 25.0)
++    assert config.activation_situ_beta == 4.0
++    assert config.activation_situ_linear_beta == 25.0
++    unset = _situ_activation_config(-1.0, -1.0)
++    assert unset.activation_situ_beta is None
++    assert unset.activation_situ_linear_beta is None
+diff --git a/vllm_gguf_plugin/config_parser.py b/vllm_gguf_plugin/config_parser.py
+index 9fa67cb..9ccf117 100644
+--- a/vllm_gguf_plugin/config_parser.py
++++ b/vllm_gguf_plugin/config_parser.py
+@@ -39,10 +39,20 @@ class GGUFConfigParser(ConfigParserBase):
+             config_dict["norm_topk_prob"] = True
+             config.update({"norm_topk_prob": True})
+ 
+-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
++        # Kimi-K3/Kimi-Linear are vLLM-native architectures but are not in
++        # Transformers' static AutoModel mapping.  The released K3 GGUF is
++        # text-only, so its flattened config intentionally selects the native
++        # KimiLinearForCausalLM implementation.
++        vllm_native_architectures = {
++            "kimi_k3": "KimiK3ForConditionalGeneration",
++            "kimi_linear": "KimiLinearForCausalLM",
++        }
++        if config.model_type in vllm_native_architectures:
++            model_type = vllm_native_architectures[config.model_type]
++        elif config.model_type in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
++            model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
++        else:
+             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+-
+-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+         config_dict["architectures"] = [model_type]
+         config.update({"architectures": [model_type]})
+ 
+diff --git a/vllm_gguf_plugin/quantization/fused_moe.py b/vllm_gguf_plugin/quantization/fused_moe.py
+index fb717c9..748053e 100644
+--- a/vllm_gguf_plugin/quantization/fused_moe.py
++++ b/vllm_gguf_plugin/quantization/fused_moe.py
+@@ -8,6 +8,7 @@ from vllm.model_executor.layers.fused_moe import (
+     RoutedExperts,
+ )
+ from vllm.model_executor.layers.fused_moe.activation import (
++    ApplyMoEActivationConfig,
+     MoEActivation,
+     apply_moe_activation,
+ )
+@@ -31,6 +32,16 @@ from .params import (
+ from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
+ 
+ 
++def _situ_activation_config(
++    beta: float, linear_beta: float
++) -> ApplyMoEActivationConfig:
++    """Translate custom-op float sentinels back to optional SITU settings."""
++    return ApplyMoEActivationConfig(
++        activation_situ_beta=beta if beta >= 0 else None,
++        activation_situ_linear_beta=(linear_beta if linear_beta >= 0 else None),
++    )
++
++
+ def _fused_moe_gguf(
+     x: torch.Tensor,
+     w1: torch.Tensor,
+@@ -40,14 +51,24 @@ def _fused_moe_gguf(
+     qweight_type: int,
+     qweight_type2: int,
+     activation: str,
++    activation_situ_beta: float,
++    activation_situ_linear_beta: float,
+ ) -> torch.Tensor:
+     activation_enum = MoEActivation.from_str(activation)
++    activation_config = _situ_activation_config(
++        activation_situ_beta, activation_situ_linear_beta
++    )
+ 
+     def act(inp: torch.Tensor):
+         d = inp.shape[-1] // 2
+         output_shape = inp.shape[:-1] + (d,)
+         out = torch.empty(output_shape, dtype=inp.dtype, device=inp.device)
+-        apply_moe_activation(activation_enum, out, inp)
++        apply_moe_activation(
++            activation_enum,
++            out,
++            inp,
++            activation_config=activation_config,
++        )
+         return out
+ 
+     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+@@ -142,8 +163,20 @@ def _fused_moe_gguf_fake(
+     qweight_type: int,
+     qweight_type2: int,
+     activation: str,
++    activation_situ_beta: float,
++    activation_situ_linear_beta: float,
+ ) -> torch.Tensor:
+-    del w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2, activation
++    del (
++        w1,
++        w2,
++        topk_weights,
++        topk_ids,
++        qweight_type,
++        qweight_type2,
++        activation,
++        activation_situ_beta,
++        activation_situ_linear_beta,
++    )
+     return torch.empty_like(x)
+ 
+ 
+@@ -275,4 +308,14 @@ class GGUFMoEMethod(FusedMoEMethodBase):
+             layer.w13_qweight_type.weight_type,
+             layer.w2_qweight_type.weight_type,
+             layer.activation.value,
++            float(
++                self.moe.activation_situ_beta
++                if self.moe.activation_situ_beta is not None
++                else -1.0
++            ),
++            float(
++                self.moe.activation_situ_linear_beta
++                if self.moe.activation_situ_linear_beta is not None
++                else -1.0
++            ),
+         )
+diff --git a/vllm_gguf_plugin/weights_adapter/__init__.py b/vllm_gguf_plugin/weights_adapter/__init__.py
+index c70201d..0581f45 100644
+--- a/vllm_gguf_plugin/weights_adapter/__init__.py
++++ b/vllm_gguf_plugin/weights_adapter/__init__.py
+@@ -11,8 +11,10 @@ from .diffusion import (
+     get_diffusion_gguf_adapter,
+ )
+ from .gemma3 import Gemma3GGUFAdapter
++from .kimi_k3 import KimiK3NeuronGGUFAdapter
+ 
+ _ADAPTER_REGISTRY: list[type[GGUFWeightsAdapter]] = [
++    KimiK3NeuronGGUFAdapter,
+     Gemma3GGUFAdapter,
+ ]
+ 
+@@ -31,6 +33,7 @@ __all__ = [
+     "Flux2KleinDiffusionGGUFAdapter",
+     "GGUFWeightsAdapter",
+     "Gemma3GGUFAdapter",
++    "KimiK3NeuronGGUFAdapter",
+     "QwenImageDiffusionGGUFAdapter",
+     "ZImageDiffusionGGUFAdapter",
+     "get_diffusion_gguf_adapter",
+diff --git a/vllm_gguf_plugin/weights_adapter/kimi_k3.py b/vllm_gguf_plugin/weights_adapter/kimi_k3.py
+new file mode 100644
+index 0000000..55d0781
+--- /dev/null
++++ b/vllm_gguf_plugin/weights_adapter/kimi_k3.py
+@@ -0,0 +1,323 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Text-only adapter for the pruned Kimi-K3 Neuron GGUF.
++
++Kimi-K3's GGUF conversion is not a name-only conversion.  It stacks routed
++experts, fuses attention-residual norm/projection vectors, folds ``A_log`` to
++``-exp(A_log)``, reshapes the KDA convolutions, and splits MLA ``kv_b_proj``.
++This adapter reverses those transformations while presenting the text-only
++``KimiLinearForCausalLM`` checkpoint namespace to vLLM.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Iterable
++from typing import TYPE_CHECKING
++
++import gguf
++import numpy as np
++import torch
++
++from ..gguf_utils import maybe_patch_hf_config_from_gguf
++from ..weight_utils import (
++    get_gguf_weight_type_map,
++    gguf_quant_weights_iterator_multi,
++)
++from .base import BaseGGUFWeightsAdapter, GGUFLoadSpec
++
++if TYPE_CHECKING:
++    from transformers import PretrainedConfig
++    from vllm.config import ModelConfig
++
++
++_CONV_RE = re.compile(r"^__k3_conv__\.(\d+)\.([qkv])\.(weight|qweight|qweight_type)$")
++_KVB_RE = re.compile(r"^__k3_kvb__\.(\d+)\.([kv])\.(weight|qweight|qweight_type)$")
++
++
++def _field_scalar(reader: gguf.GGUFReader, name: str):
++    field = reader.get_field(name)
++    if field is None:
++        return None
++    value = field.parts[-1]
++    return value.item() if hasattr(value, "item") else value
++
++
++def _dequantize(weight: torch.Tensor, qtype: int | None) -> torch.Tensor:
++    if qtype is None:
++        return weight.float()
++    array = gguf.quants.dequantize(
++        weight.detach().cpu().numpy(), gguf.GGMLQuantizationType(qtype)
++    )
++    # Copy: gguf's result may be a non-writable view.
++    return torch.from_numpy(np.array(array, copy=True))
++
++
++class KimiK3NeuronGGUFAdapter(BaseGGUFWeightsAdapter):
++    """Adapter for the text-only, 1536-wide Kimi-K3 Neuron artifact."""
++
++    load_spec: GGUFLoadSpec | None = None
++    name_map: dict[str, str] | None = None
++
++    @classmethod
++    def matches(cls, config: PretrainedConfig) -> bool:
++        text = config.get_text_config()
++        return (
++            config.model_type in ("kimi_linear", "kimi_k3")
++            and getattr(text, "attn_res_block_size", None) is not None
++            and getattr(text, "routed_expert_hidden_size", None) is not None
++            and getattr(text, "hidden_act", None) == "situ"
++        )
++
++    def patch_hf_config(
++        self, model_path: str, hf_config: PretrainedConfig
++    ) -> PretrainedConfig:
++        hf_config = maybe_patch_hf_config_from_gguf(model_path, hf_config)
++        reader = gguf.GGUFReader(model_path)
++        width = _field_scalar(reader, "kimi-k3.expert_feed_forward_length")
++        if width is None:
++            raise RuntimeError(
++                "Kimi-K3 GGUF is missing kimi-k3.expert_feed_forward_length"
++            )
++        text = hf_config.get_text_config()
++        text.update({"moe_intermediate_size": int(width)})
++        return hf_config
++
++    @staticmethod
++    def build_name_map(config: PretrainedConfig) -> dict[str, str]:
++        """Map raw GGUF names to the flat KimiLinear checkpoint namespace."""
++        text = config.get_text_config()
++        n_layers = int(text.num_hidden_layers)
++        first_dense = int(text.first_k_dense_replace)
++        kda_layers = set(text.linear_attn_config["kda_layers"])
++
++        result = {
++            "token_embd.weight": "model.embed_tokens.weight",
++            "output_norm.weight": "model.norm.weight",
++            "output.weight": "lm_head.weight",
++            # The converter stores norm.weight * proj.weight as one vector.
++            "output_res_score.weight": "model.output_attn_res_proj.weight",
++        }
++
++        for i in range(n_layers):
++            gg = f"blk.{i}"
++            hf = f"model.layers.{i}"
++            result.update(
++                {
++                    f"{gg}.attn_norm.weight": f"{hf}.input_layernorm.weight",
++                    f"{gg}.ffn_norm.weight": f"{hf}.post_attention_layernorm.weight",
++                    f"{gg}.attn_res_score.weight": (
++                        f"{hf}.self_attention_res_proj.weight"
++                    ),
++                    f"{gg}.ffn_res_score.weight": f"{hf}.mlp_res_proj.weight",
++                }
++            )
++
++            if (i + 1) in kda_layers:
++                for part in "qkv":
++                    result[f"{gg}.ssm_conv1d_{part}.weight"] = (
++                        f"__k3_conv__.{i}.{part}.weight"
++                    )
++                result.update(
++                    {
++                        f"{gg}.attn_q.weight": f"{hf}.self_attn.q_proj.weight",
++                        f"{gg}.attn_k.weight": f"{hf}.self_attn.k_proj.weight",
++                        f"{gg}.attn_v.weight": f"{hf}.self_attn.v_proj.weight",
++                        f"{gg}.ssm_f_a.weight": f"{hf}.self_attn.f_a_proj.weight",
++                        f"{gg}.ssm_f_b.weight": f"{hf}.self_attn.f_b_proj.weight",
++                        f"{gg}.ssm_beta.weight": f"{hf}.self_attn.b_proj.weight",
++                        f"{gg}.ssm_g.weight": f"{hf}.self_attn.g_proj.weight",
++                        f"{gg}.ssm_a": f"{hf}.self_attn.A_log",
++                        f"{gg}.ssm_dt.bias": f"{hf}.self_attn.dt_bias",
++                        f"{gg}.ssm_norm.weight": f"{hf}.self_attn.o_norm.weight",
++                        f"{gg}.attn_output.weight": f"{hf}.self_attn.o_proj.weight",
++                    }
++                )
++            else:
++                result.update(
++                    {
++                        f"{gg}.attn_q_a_norm.weight": (
++                            f"{hf}.self_attn.q_a_layernorm.weight"
++                        ),
++                        f"{gg}.attn_kv_a_norm.weight": (
++                            f"{hf}.self_attn.kv_a_layernorm.weight"
++                        ),
++                        f"{gg}.attn_q_a.weight": f"{hf}.self_attn.q_a_proj.weight",
++                        f"{gg}.attn_q_b.weight": f"{hf}.self_attn.q_b_proj.weight",
++                        f"{gg}.attn_kv_a_mqa.weight": (
++                            f"{hf}.self_attn.kv_a_proj_with_mqa.weight"
++                        ),
++                        # Rejoined after one-time CPU dequantization below.
++                        f"{gg}.attn_k_b.weight": f"__k3_kvb__.{i}.k.weight",
++                        f"{gg}.attn_v_b.weight": f"__k3_kvb__.{i}.v.weight",
++                        f"{gg}.attn_gate.weight": f"{hf}.self_attn.g_proj.weight",
++                        f"{gg}.attn_output.weight": f"{hf}.self_attn.o_proj.weight",
++                    }
++                )
++
++            if i < first_dense:
++                result.update(
++                    {
++                        f"{gg}.ffn_gate.weight": f"{hf}.mlp.gate_proj.weight",
++                        f"{gg}.ffn_up.weight": f"{hf}.mlp.up_proj.weight",
++                        f"{gg}.ffn_down.weight": f"{hf}.mlp.down_proj.weight",
++                    }
++                )
++                continue
++
++            moe = f"{hf}.block_sparse_moe"
++            result.update(
++                {
++                    f"{gg}.ffn_gate_inp.weight": f"{moe}.gate.weight",
++                    f"{gg}.exp_probs_b.bias": f"{moe}.gate.e_score_correction_bias",
++                    f"{gg}.ffn_gate_exps.weight": f"{moe}.experts.0.w1.weight",
++                    f"{gg}.ffn_down_exps.weight": f"{moe}.experts.0.w2.weight",
++                    f"{gg}.ffn_up_exps.weight": f"{moe}.experts.0.w3.weight",
++                    f"{gg}.ffn_routed_down.weight": (
++                        f"{moe}.routed_expert_down_proj.weight"
++                    ),
++                    f"{gg}.ffn_routed_up.weight": (
++                        f"{moe}.routed_expert_up_proj.weight"
++                    ),
++                    f"{gg}.ffn_routed_norm.weight": (
++                        f"{moe}.routed_expert_norm.weight"
++                    ),
++                    f"{gg}.ffn_gate_shexp.weight": (
++                        f"{moe}.shared_experts.gate_proj.weight"
++                    ),
++                    f"{gg}.ffn_down_shexp.weight": (
++                        f"{moe}.shared_experts.down_proj.weight"
++                    ),
++                    f"{gg}.ffn_up_shexp.weight": (
++                        f"{moe}.shared_experts.up_proj.weight"
++                    ),
++                }
++            )
++        return result
++
++    @staticmethod
++    def _get_all_gguf_files(model_path: str) -> list[str]:
++        # Keep shard discovery identical to the default adapter.
++        from .default import GGUFWeightsAdapter
++
++        return GGUFWeightsAdapter._get_all_gguf_files(model_path)
++
++    def prepare_loading(
++        self, model_path: str, model_config: ModelConfig
++    ) -> GGUFLoadSpec:
++        model_config.hf_config = self.patch_hf_config(
++            model_path, model_config.hf_config
++        )
++        self.name_map = self.build_name_map(model_config.hf_config)
++        files = self._get_all_gguf_files(model_path)
++        weight_types: dict[str, str] = {}
++        for path in files:
++            weight_types.update(get_gguf_weight_type_map(path, self.name_map))
++
++        unquantized = {
++            name.removesuffix(".weight")
++            for name, qtype in weight_types.items()
++            if qtype in ("F32", "F16", "BF16")
++            and name.endswith(".weight")
++            and not name.startswith("__k3_")
++        }
++        # kv_b is split/transposed in GGUF and is absorbed by MLA after load;
++        # dequantizing it once is simpler and only ~600 MB for all 24 layers.
++        for i in range(int(model_config.hf_config.num_hidden_layers)):
++            if (i + 1) not in set(
++                model_config.hf_config.linear_attn_config["kda_layers"]
++            ):
++                unquantized.add(f"model.layers.{i}.self_attn.kv_b_proj")
++
++        self.load_spec = GGUFLoadSpec(
++            weights_source=files,
++            gguf_to_hf_name_map=self.name_map,
++            unquantized_modules=sorted(unquantized),
++        )
++        return self.load_spec
++
++    @staticmethod
++    def _split_experts(
++        name: str, weight: torch.Tensor
++    ) -> Iterable[tuple[str, torch.Tensor]]:
++        if weight.ndim == 3 and ".experts.0." in name:
++            for expert_id, expert_weight in enumerate(weight.unbind()):
++                yield name.replace(
++                    ".experts.0.", f".experts.{expert_id}."
++                ), expert_weight
++        else:
++            yield name, weight
++
++    def prepare_weights(
++        self, model_config: ModelConfig
++    ) -> Iterable[tuple[str, torch.Tensor]]:
++        del model_config
++        assert self.load_spec is not None
++        assert self.load_spec.gguf_to_hf_name_map is not None
++        weights = gguf_quant_weights_iterator_multi(
++            self.load_spec.weights_source,
++            self.load_spec.gguf_to_hf_name_map,
++        )
++
++        forced_qtypes: dict[str, int] = {}
++        kv_parts: dict[int, dict[str, torch.Tensor]] = {}
++
++        for name, weight in weights:
++            conv_match = _CONV_RE.match(name)
++            kvb_match = _KVB_RE.match(name)
++            if conv_match or kvb_match:
++                match = conv_match or kvb_match
++                assert match is not None
++                kind = match.group(3)
++                key = name.rsplit(".", 1)[0]
++                if kind == "qweight_type":
++                    forced_qtypes[key] = int(weight.item())
++                    continue
++                qtype = forced_qtypes.pop(key, None) if kind == "qweight" else None
++                value = _dequantize(weight, qtype)
++
++                if conv_match:
++                    layer, part = int(conv_match.group(1)), conv_match.group(2)
++                    # Converter layout: [d_inner,1,d_conv] -> [1,d_inner,1,d_conv].
++                    if value.ndim == 4:
++                        value = value.reshape(value.shape[1], 1, value.shape[-1])
++                    yield (
++                        f"model.layers.{layer}.self_attn.{part}_conv1d.weight",
++                        value.float(),
++                    )
++                    continue
++
++                layer, part = int(kvb_match.group(1)), kvb_match.group(2)
++                kv_parts.setdefault(layer, {})[part] = value
++                if set(kv_parts[layer]) == {"k", "v"}:
++                    k = kv_parts[layer]["k"].transpose(1, 2)
++                    v = kv_parts[layer]["v"]
++                    joined = torch.cat((k, v), dim=1).reshape(-1, v.shape[-1])
++                    yield (
++                        f"model.layers.{layer}.self_attn.kv_b_proj.weight",
++                        joined.to(torch.bfloat16),
++                    )
++                    del kv_parts[layer]
++                continue
++
++            if name.endswith("_res_proj.weight"):
++                flat = weight.float().flatten()
++                yield name.replace("_res_proj.weight", "_res_norm.weight"), (
++                    torch.ones_like(flat)
++                )
++                yield name, flat.reshape(1, -1)
++                continue
++            if name == "model.output_attn_res_proj.weight":
++                flat = weight.float().flatten()
++                yield "model.output_attn_res_norm.weight", torch.ones_like(flat)
++                yield name, flat.reshape(1, -1)
++                continue
++            if name.endswith(".self_attn.A_log"):
++                weight = torch.log((-weight.float()).clamp_min(torch.finfo(torch.float32).tiny))
++
++            yield from self._split_experts(name, weight)
++
++        if forced_qtypes or kv_parts:
++            raise RuntimeError(
++                f"Incomplete Kimi-K3 transformed weights: "
++                f"qtypes={sorted(forced_qtypes)}, kv_layers={sorted(kv_parts)}"
++            )
+-- 
+2.52.0.windows.1
+

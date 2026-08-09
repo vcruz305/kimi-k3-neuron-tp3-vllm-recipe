@@ -1,0 +1,83 @@
+From ccdd53e233cbe0c94f99c709deeb33b97c5ea420 Mon Sep 17 00:00:00 2001
+From: Codex K3 Adapter <codex-k3@localhost>
+Date: Sat, 8 Aug 2026 15:36:54 -0700
+Subject: [PATCH] fix(moe): guard CUDA vector grid z limit
+
+---
+ tests/test_ops.py       | 26 ++++++++++++++++++++++++++
+ vllm_gguf_plugin/ops.py | 19 ++++++++++++++++++-
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test_ops.py
+
+diff --git a/tests/test_ops.py b/tests/test_ops.py
+new file mode 100644
+index 0000000..58efcb9
+--- /dev/null
++++ b/tests/test_ops.py
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import vllm_gguf_plugin.ops as gguf_ops
++
++
++def test_cuda_moe_vec_respects_grid_z_limit(monkeypatch):
++    monkeypatch.setattr(
++        gguf_ops,
++        "_cuda_kernel_available",
++        lambda _kernel, _quant_type: True,
++    )
++
++    assert gguf_ops._cuda_moe_vec_kernel_available(19, top_k=16, tokens=4095)
++    assert not gguf_ops._cuda_moe_vec_kernel_available(19, top_k=16, tokens=4096)
++    assert gguf_ops._cuda_moe_vec_kernel_available(19, top_k=1, tokens=65535)
++    assert not gguf_ops._cuda_moe_vec_kernel_available(19, top_k=1, tokens=65536)
++
++
++def test_cuda_moe_vec_still_checks_kernel_support(monkeypatch):
++    monkeypatch.setattr(
++        gguf_ops,
++        "_cuda_kernel_available",
++        lambda _kernel, _quant_type: False,
++    )
++
++    assert not gguf_ops._cuda_moe_vec_kernel_available(19, top_k=16, tokens=1)
+diff --git a/vllm_gguf_plugin/ops.py b/vllm_gguf_plugin/ops.py
+index cc3a0d3..f083e4b 100644
+--- a/vllm_gguf_plugin/ops.py
++++ b/vllm_gguf_plugin/ops.py
+@@ -253,7 +253,7 @@ def ggml_moe_a8_vec(
+     row: int,
+     tokens: int,
+ ) -> torch.Tensor:
+-    if _cuda_kernel_available("ggml_moe_a8_vec", quant_type):
++    if _cuda_moe_vec_kernel_available(quant_type, top_k, tokens):
+         return torch.ops._C_gguf.ggml_moe_a8_vec(
+             X, W, topk_ids, top_k, quant_type, row, tokens
+         )
+@@ -276,6 +276,23 @@ def ggml_moe_a8_vec(
+     )
+ 
+ 
++# ``moe_vec_q`` maps one routed token to CUDA grid.z.  CUDA permits at most
++# 65,535 blocks in z; Kimi-K3's 4,096-token profile with top-16 routing asks
++# for 65,536 and otherwise fails asynchronously with ``invalid argument``.
++_CUDA_MOE_VEC_MAX_GRID_Z = 65_535
++
++
++def _cuda_moe_vec_kernel_available(
++    quant_type: int,
++    top_k: int,
++    tokens: int,
++) -> bool:
++    return (
++        tokens * top_k <= _CUDA_MOE_VEC_MAX_GRID_Z
++        and _cuda_kernel_available("ggml_moe_a8_vec", quant_type)
++    )
++
++
+ def ggml_moe_get_block_size(quant_type: int) -> int:
+     if _cuda_gemm_kernel_available("ggml_moe_get_block_size", quant_type):
+         return torch.ops._C_gguf.ggml_moe_get_block_size(quant_type)
+-- 
+2.52.0.windows.1
+

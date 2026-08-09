@@ -1,0 +1,244 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 7beecf8..eb5d7ea 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1122,6 +1122,14 @@ class SpeculativeConfig:
+                         self.draft_model_config.hf_config,
+                     )
+                 )
++                if (
++                    self.method == "dspark"
++                    and "K3DSparkModel" in self.draft_model_config.architectures
++                ):
++                    SpeculativeConfig._pad_k3_dspark_for_tp(
++                        self.draft_model_config,
++                        self.draft_tensor_parallel_size,
++                    )
+                 self.draft_model_config.max_model_len = (
+                     SpeculativeConfig._maybe_override_draft_max_model_len(
+                         self.max_model_len,
+@@ -1252,6 +1260,60 @@ class SpeculativeConfig:
+         )
+         draft_hf_config.max_position_embeddings = target_max_model_len
+ 
++    @staticmethod
++    def _pad_k3_dspark_for_tp(
++        draft_model_config: ModelConfig,
++        draft_tensor_parallel_size: int,
++    ) -> None:
++        """Pad K3 DSpark heads and MLP width for otherwise-incompatible TP."""
++        if draft_tensor_parallel_size <= 1:
++            return
++
++        hf_config = draft_model_config.hf_config
++        checkpoint_num_heads = getattr(
++            hf_config,
++            "_vllm_checkpoint_num_attention_heads",
++            hf_config.num_attention_heads,
++        )
++        checkpoint_intermediate_size = getattr(
++            hf_config,
++            "_vllm_checkpoint_intermediate_size",
++            hf_config.intermediate_size,
++        )
++
++        def align_up(value: int) -> int:
++            return (
++                (value + draft_tensor_parallel_size - 1)
++                // draft_tensor_parallel_size
++                * draft_tensor_parallel_size
++            )
++
++        padded_num_heads = align_up(checkpoint_num_heads)
++        padded_intermediate_size = align_up(checkpoint_intermediate_size)
++        if (
++            padded_num_heads == checkpoint_num_heads
++            and padded_intermediate_size == checkpoint_intermediate_size
++        ):
++            return
++
++        hf_config._vllm_checkpoint_num_attention_heads = checkpoint_num_heads
++        hf_config._vllm_checkpoint_intermediate_size = checkpoint_intermediate_size
++        hf_config.num_attention_heads = padded_num_heads
++        hf_config.intermediate_size = padded_intermediate_size
++        draft_model_config.model_arch_config.total_num_attention_heads = (
++            padded_num_heads
++        )
++        logger.warning(
++            "Padding K3 DSpark for TP%d: attention heads %d -> %d and "
++            "intermediate size %d -> %d. Checkpoint weights for the added "
++            "dimensions are zero-filled during loading.",
++            draft_tensor_parallel_size,
++            checkpoint_num_heads,
++            padded_num_heads,
++            checkpoint_intermediate_size,
++            padded_intermediate_size,
++        )
++
+     @staticmethod
+     def _verify_and_get_draft_tp(
+         target_parallel_config: ParallelConfig,
+diff --git a/vllm/model_executor/models/utils.py b/vllm/model_executor/models/utils.py
+index 5e1236a..23fe4a1 100644
+--- a/vllm/model_executor/models/utils.py
++++ b/vllm/model_executor/models/utils.py
+@@ -892,8 +892,10 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
+     Returns:
+         The draft model's config if available, None otherwise.
+     """
+-    draft_model_config = vllm_config.speculative_config.draft_model_config
+-    draft_load_config = vllm_config.load_config
++    speculative_config = vllm_config.speculative_config
++    assert speculative_config is not None
++    draft_model_config = speculative_config.draft_model_config
++    draft_load_config = speculative_config.draft_load_config or vllm_config.load_config
+ 
+     return (
+         VllmConfig.get_quantization_config(draft_model_config, draft_load_config)
+diff --git a/vllm/models/kimi_k3/nvidia/dspark_mla.py b/vllm/models/kimi_k3/nvidia/dspark_mla.py
+index 81715e0..9f6ffde 100644
+--- a/vllm/models/kimi_k3/nvidia/dspark_mla.py
++++ b/vllm/models/kimi_k3/nvidia/dspark_mla.py
+@@ -51,6 +51,103 @@ def _duplicate_context_kv_weights(
+         yield f"context_kv_proj.{param_name}", fused_weight
+ 
+ 
++def _zero_pad_dimension(
++    weight: torch.Tensor,
++    *,
++    dimension: int,
++    checkpoint_size: int,
++    padded_size: int,
++    name: str,
++) -> torch.Tensor:
++    current_size = weight.shape[dimension]
++    if current_size == padded_size:
++        return weight
++    if current_size != checkpoint_size:
++        raise ValueError(
++            f"Cannot TP-pad {name}: expected dimension {dimension} to have "
++            f"size {checkpoint_size}, got {current_size}."
++        )
++    pad_shape = list(weight.shape)
++    pad_shape[dimension] = padded_size - checkpoint_size
++    return torch.cat((weight, weight.new_zeros(pad_shape)), dim=dimension)
++
++
++def _pad_k3_dspark_tp_weights(
++    weights: Iterable[tuple[str, torch.Tensor]], config
++) -> Iterable[tuple[str, torch.Tensor]]:
++    """Zero-pad released K3 DSpark weights to the runtime TP geometry."""
++    checkpoint_num_heads = getattr(
++        config, "_vllm_checkpoint_num_attention_heads", config.num_attention_heads
++    )
++    checkpoint_intermediate_size = getattr(
++        config, "_vllm_checkpoint_intermediate_size", config.intermediate_size
++    )
++    padded_num_heads = config.num_attention_heads
++    padded_intermediate_size = config.intermediate_size
++    qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
++    kv_head_dim = config.qk_nope_head_dim + config.v_head_dim
++
++    for name, weight in weights:
++        if name.endswith((".self_attn.q_b_proj.weight", ".self_attn.q_proj.weight")):
++            weight = _zero_pad_dimension(
++                weight,
++                dimension=0,
++                checkpoint_size=checkpoint_num_heads * qk_head_dim,
++                padded_size=padded_num_heads * qk_head_dim,
++                name=name,
++            )
++        elif name.endswith(".self_attn.kv_b_proj.weight"):
++            weight = _zero_pad_dimension(
++                weight,
++                dimension=0,
++                checkpoint_size=checkpoint_num_heads * kv_head_dim,
++                padded_size=padded_num_heads * kv_head_dim,
++                name=name,
++            )
++        elif name.endswith(".self_attn.o_proj.weight"):
++            weight = _zero_pad_dimension(
++                weight,
++                dimension=1,
++                checkpoint_size=checkpoint_num_heads * config.v_head_dim,
++                padded_size=padded_num_heads * config.v_head_dim,
++                name=name,
++            )
++        elif name.endswith((".mlp.gate_proj.weight", ".mlp.up_proj.weight")):
++            weight = _zero_pad_dimension(
++                weight,
++                dimension=0,
++                checkpoint_size=checkpoint_intermediate_size,
++                padded_size=padded_intermediate_size,
++                name=name,
++            )
++        elif name.endswith(".mlp.down_proj.weight"):
++            weight = _zero_pad_dimension(
++                weight,
++                dimension=1,
++                checkpoint_size=checkpoint_intermediate_size,
++                padded_size=padded_intermediate_size,
++                name=name,
++            )
++        elif name.endswith(".mlp.gate_up_proj.weight"):
++            gate, up = weight.split(checkpoint_intermediate_size, dim=0)
++            gate = _zero_pad_dimension(
++                gate,
++                dimension=0,
++                checkpoint_size=checkpoint_intermediate_size,
++                padded_size=padded_intermediate_size,
++                name=name,
++            )
++            up = _zero_pad_dimension(
++                up,
++                dimension=0,
++                checkpoint_size=checkpoint_intermediate_size,
++                padded_size=padded_intermediate_size,
++                name=name,
++            )
++            weight = torch.cat((gate, up), dim=0)
++        yield name, weight
++
++
+ class K3DSparkDecoderLayer(nn.Module):
+     def __init__(
+         self,
+@@ -483,6 +580,7 @@ class K3DSparkForCausalLM(nn.Module):
+             self,
+             skip_substrs=list(self.checkpoint_skip_substrs),
+         )
++        weights = _pad_k3_dspark_tp_weights(weights, self.config)
+         # read: 1. all weights. 2. context kv weights
+         weights = _duplicate_context_kv_weights(weights, len(self.model.layers))
+         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index 13c7644..99c1a24 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -16,6 +16,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     speculative_config = vllm_config.speculative_config
+     assert speculative_config is not None
+     draft_model_config = speculative_config.draft_model_config
++    draft_load_config = speculative_config.draft_load_config or vllm_config.load_config
+ 
+     from vllm.compilation.backends import set_model_tag
+     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
+@@ -23,6 +24,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+ 
+     draft_vllm_config = replace(
+         vllm_config,
++        load_config=draft_load_config,
+         attention_config=replace(
+             vllm_config.attention_config,
+             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
+@@ -43,7 +45,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+ 
+     with set_model_tag("dspark_head"):
+         draft_model = get_model(
+-            vllm_config=draft_vllm_config, model_config=draft_model_config
++            vllm_config=draft_vllm_config,
++            model_config=draft_model_config,
++            load_config=draft_load_config,
+         )
+ 
+     if get_pp_group().world_size != 1:

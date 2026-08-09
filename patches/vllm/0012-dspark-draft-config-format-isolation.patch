@@ -1,0 +1,25 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index eb5d7ea..23e257c 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -888,11 +888,19 @@ class SpeculativeConfig:
+                     spec_target_max_model_len=self.target_model_config.max_model_len,
+                     quantization=self.quantization,
+                     enforce_eager=self.target_model_config.enforce_eager,
+                     max_logprobs=self.target_model_config.max_logprobs,
+                     hf_overrides=draft_hf_overrides,
+-                    config_format=self.target_model_config.config_format,
++                    # A separately configured draft loader identifies a
++                    # distinct checkpoint.  Discover its Hugging Face config
++                    # independently instead of inheriting a GGUF target's
++                    # parser selection.
++                    config_format=(
++                        "auto"
++                        if self.draft_load_config is not None
++                        else self.target_model_config.config_format
++                    ),
+                 )
+ 
+                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
+                 # omit vocab_size in config.json, so MedusaConfig falls back to
+                 # its default (32001). Align with the target model's vocab size
