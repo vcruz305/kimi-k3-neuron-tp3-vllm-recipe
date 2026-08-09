@@ -13,7 +13,7 @@ and are labelled as such.
 |---|---|
 | Does it run on **3** Sparks? | **No, not at the current prune width.** Weights alone are 103.97 GiB/rank against ~110 GiB usable, before ~22 GiB/rank of measured runtime overhead. |
 | Does it run on **4** Sparks? | **Yes.** 78.53 GiB/rank weights, ~31 GiB headroom. This is the recommended target. |
-| Does 3 Sparks work at a narrower prune? | **Yes, at k=1024** (33.3% FFN retention): 75.12 GiB/rank. Requires re-running compression, and the quality cost is unmeasured. |
+| Does 3 Sparks work at a narrower prune? | **Yes, at k=1024** (33.3% FFN retention): 76.45 GiB/rank. Requires re-running compression, and the quality cost is unmeasured. **k=1280 does not fit** (90.21 GiB/rank against an ~88 GiB budget). |
 | Expected speed | **10-25 token/s** estimated, against 7.90 token/s measured on 4-Spark SparkInfer today. Not 50. |
 | Biggest risk | The speculative half may not transfer at all - see "Regime shift". |
 
@@ -84,25 +84,43 @@ even TP:
 
 ### Prune width versus fit
 
-Scaling the measured split (expert FFN 259.66 GiB, fixed 47.83 GiB):
+**Only the routed experts scale with k.** An earlier revision of this table
+scaled the whole 259.66 GiB expert bucket, which is wrong: that bucket is
+routed 247.63 GiB **plus shared 12.03 GiB**, and the shared experts are
+invariant by construction. The build constraint `k * n_expert_shared == 6144`
+holds total shared width fixed at 6144, so `ffn_*_shexp` is `[7168, 6144]`
+Q8_0 at every legal k — at k=1536 that is 4 shared experts, at k=1024 it is 6.
+Verified directly against the shipped GGUF's tensor shapes.
+
+So the correct split is **k-scaling 247.63 GiB, k-independent 59.85 GiB**
+(shared experts 12.03 + attention 29.58 + other 13.87 + embed/output 4.38).
+The 59.85 GiB is a floor no prune width can go below.
 
 | k | FFN retention | total GiB | TP3 GiB/rank | TP4 GiB/rank |
 |---:|---:|---:|---:|---:|
-| 512 | 16.7% | 134.38 | 46.27 | 35.25 |
-| 768 | 25.0% | 177.66 | 60.69 | 46.07 |
-| **1024** | **33.3%** | **220.93** | **75.12** | **56.89** |
-| 1280 | 41.7% | 264.21 | 89.54 | 67.71 |
+| 512 | 16.7% | 142.39 | 48.94 | 37.26 |
+| 768 | 25.0% | 183.66 | 62.69 | 47.57 |
+| **1024** | **33.3%** | **224.94** | **76.45** | **57.89** |
+| 1280 | 41.7% | 266.21 | 90.21 | 68.21 |
 | **1536 (current)** | **50.0%** | **307.49** | **103.97** | **78.53** |
-| 1792 | 58.3% | 350.76 | 118.39 | 89.35 |
-| 2048 | 66.7% | 394.04 | 132.82 | 100.17 |
+| 1792 | 58.3% | 348.75 | 117.72 | 88.85 |
+| 2048 | 66.7% | 390.02 | 131.48 | 99.16 |
+
+Per-rank uses the Phase 0 replication model: `(total - 2.21) / N + 2.21`, where
+2.21 GiB of router and norms is replicated on every rank. It reproduces the
+measured k=1536 row exactly at both TP3 and TP4.
 
 With a ~88 GiB weight budget per Spark (110 usable minus 22 overhead),
-**k=1024 fits 3 Sparks comfortably at 75.12 GiB/rank**, and k=1280 sits right on
-the edge at 89.54. Note `k=1024` satisfies the documented constraint
-(`k * n_expert_shared == 6144` with `n_expert_shared = 6`, and `k % 256 == 0`).
+**k=1024 fits 3 Sparks at 76.45 GiB/rank**. Note `k=1024` satisfies the
+documented constraint (`k * n_expert_shared == 6144` with `n_expert_shared = 6`,
+and `k % 256 == 0`).
+
+**k=1280 no longer fits 3 Sparks.** The old table put it at 89.54, described as
+"right on the edge" of the 88 GiB budget; corrected, it is **90.21 GiB/rank** —
+over. Anyone relying on the previous number should re-plan at k=1024.
 
 Going the other way is not viable: k=2048 (66.7% retention) needs
-**132.82 GiB/rank at TP3**, worse than today and beyond any Spark.
+**131.48 GiB/rank at TP3**, worse than today and beyond any Spark.
 
 ## Blocker 1 - sm_121 on aarch64
 

@@ -100,9 +100,10 @@ Blackwell hardware, this is the one likely to avoid the Triton fallback.
    [vLLM #36821](https://github.com/vllm-project/vllm/issues/36821). Either rely
    on the `12.0+PTX` JIT path or rebuild from source for aarch64.
 2. **Memory.** Per `docs/DGX-SPARK-PORT.md`, the 307.49 GiB model measures
-   **84.06 GiB/rank at TP4**, so it needs **4 Sparks, not 3**. A larger
-   IQ2-class build (~353.71 GiB) scales that to roughly **88 GiB/rank at TP4**
-   and does **not** fit 3 Sparks at all.
+   **78.53 GiB/rank at TP4** (305.28 GiB shardable / 4, plus 2.21 GiB of
+   replicated router and norms), so it needs **4 Sparks, not 3** — TP3 is
+   103.97 GiB/rank. A larger IQ2-class build (~353.71 GiB) scales that to
+   **90.09 GiB/rank at TP4** and does **not** fit 3 Sparks at all.
 
 Backend expectation is the same as sm_120: `TRITON_MLA` only.
 
