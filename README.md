@@ -141,6 +141,52 @@ base is seven commits later and does not change the relevant K3/DSpark files.
 Clean patch application and source contracts are validated at the public base,
 while the integrated DSpark GPU run at that base remains pending.
 
+## Before you build
+
+This recipe was built and GPU-measured on exactly one architecture. Before
+spending GPU time, a Hugging Face download, or a multi-hour source build,
+run the no-hardware-damage preflight check:
+
+```bash
+python3 scripts/preflight_arch.py
+```
+
+It reports each visible GPU's compute capability and whether the installed
+torch build actually carries kernels for it (native cubin, PTX JIT, or
+neither); enumerates which of the four MLA attention backends this recipe
+cares about (`FLASH_ATTN_MLA`, `FLASHMLA`, `FLASHINFER_MLA`, `TRITON_MLA`)
+are importable and self-report support for that capability by asking vLLM's
+own backend registry, rather than assuming from a table; and prints a
+GO / GO-WITH-CAVEATS / NO-GO verdict with a recommended `attention_backend`
+and environment variables for what it found. It exits non-zero on NO-GO, so
+it can gate a build script. Add `--json` for a report intended to be safe to
+paste into a bug report (no tokens, no absolute filesystem paths, no model
+files). Read the compatibility matrix below either way.
+
+**Container fast-path.** If a prebuilt vLLM image already carries kernels
+for your architecture, this recipe's patches are pure Python and can be
+overlaid onto that image's site-packages instead of a multi-hour source
+build -- this is what the H200/sm_90 run actually did (patched Python
+overlaid onto `vllm/vllm-openai:nightly`, which happened to match
+`pins.env` exactly) and it saved roughly an hour versus building from
+source. The precondition is that the image's installed vLLM commit is
+close to this recipe's pinned base; if it has drifted, the patches may not
+apply cleanly and a source build is the safer path. There is no equivalent
+prebuilt image for sm_121 (aarch64) today -- see the matrix below.
+
+## Compatibility matrix
+
+| Architecture | Example GPU | Status | Known blockers | Recommended backend |
+|---|---|---|---|---|
+| sm_90 | H100 / H200 | **VALIDATED (GPU-measured)** | none | `TRITON_MLA` for the first correctness run (see [`docs/INTEGRATED-RUNBOOK.md`](docs/INTEGRATED-RUNBOOK.md)); `FLASH_ATTN_MLA` and `FLASHMLA` also self-report support in this vLLM pin. Optional patch [`0011`](patches/optional/0011-hopper-flashmla-noncausal-dspark.patch) applies here, and only here. |
+| sm_120 | RTX PRO 6000 (Blackwell workstation) | UNTESTED, known risk | Open upstream: [vLLM does not support DeepSeek-series models on RTX PRO 6000 / SM120](https://github.com/vllm-project/vllm/issues/26211) -- Kimi-K3 is DeepSeek-lineage MLA, so this plausibly applies. `FLASHMLA` is Hopper/Blackwell-datacenter only in this pin (`capability.major in [9, 10]`) and is not offered. Needs `VLLM_FLASH_ATTN_VERSION=2` (FA3 has no Blackwell support here). | `TRITON_MLA` (arch-agnostic fallback: its capability check always returns true in this pin). The plain `FLASHINFER_MLA` backend self-reports support for `capability.major == 10` only (Blackwell *datacenter*) in this vLLM pin -- do not assume it covers sm_120 without checking `preflight_arch.py`'s live output. A separate `FLASHINFER_MLA_SPARSE_SM120` backend exists in the pinned vLLM tree and targets sm_120 by name, but belongs to the sparse-MLA family used by different (indexer-based) models; this recipe's patches do not wire Kimi-K3 into that path. |
+| sm_121 | NVIDIA DGX Spark (GB10), aarch64 | UNTESTED, two extra blockers | Open upstream: [no sm_121 (Blackwell) support on aarch64](https://github.com/vllm-project/vllm/issues/36821). Stock PyTorch ships native kernels only through sm_120, so aarch64 needs either the `+PTX` JIT path (see [`scripts/build_from_source.sh`](scripts/build_from_source.sh)) or a full from-source build. Separately, memory: [`docs/DGX-SPARK-PORT.md`](docs/DGX-SPARK-PORT.md) measured 84.06 GiB/rank at TP4 for the 307.49 GiB model, so 4 Sparks, not 3; a larger, in-progress ~353.71 GiB IQ2-class build would scale that to roughly 88 GiB/rank at TP4 and would not fit 3 Sparks either. | `TRITON_MLA` (arch-agnostic fallback, same reasoning as sm_120). Needs `VLLM_FLASH_ATTN_VERSION=2`. |
+| sm_80 | A100 | UNTESTED | None specific to it -- it is exactly as unvalidated as sm_120 or sm_121, it has just attracted less attention because it raises no known upstream blocker. This gap is not Blackwell-specific. | `TRITON_MLA` (arch-agnostic fallback); `FLASH_ATTN_MLA` and `FLASHMLA` are not expected (both gate on major 9 or 9/10). |
+
+Run `scripts/preflight_arch.py` for the authoritative, live answer against
+your actual install -- this table is prior knowledge, not a substitute for
+it, and vLLM's own backend capability gates can change between pins.
+
 ## 1. Download pinned assets
 
 Authenticate without putting a token in a command, shell history, or this

@@ -61,6 +61,35 @@ do
 done
 
 if [[ ${K3_APPLY_OPTIONAL_HOPPER_FLASHMLA:-0} == 1 ]]; then
+  # Patch 0011 is a Hopper-only wrapper (adds non-causal support to
+  # FlashMLA for the DSpark draft) and has only ever been validated on
+  # sm_90 -- see README.md's compatibility matrix. Refuse to apply it
+  # unless the visible GPU reports compute capability 9.0, so setting
+  # K3_APPLY_OPTIONAL_HOPPER_FLASHMLA=1 on a Blackwell or Ampere box does
+  # not silently carry an untested attention path into the source tree.
+  #
+  # This checks nvidia-smi directly rather than shelling out to
+  # scripts/preflight_arch.py: this script runs before
+  # build_from_source.sh, so torch/vLLM are not guaranteed to be
+  # importable yet, and this also runs with no GPU at all inside
+  # `docker build` (see the Dockerfile) and in CI's clean-apply job. Both
+  # of those are legitimate reasons the arch cannot be verified here, not
+  # proof the target is wrong -- hence the explicit override below rather
+  # than a hard, unconditional refusal.
+  if [[ ${K3_SKIP_HOPPER_ARCH_CHECK:-0} != 1 ]]; then
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+      echo "K3_APPLY_OPTIONAL_HOPPER_FLASHMLA=1 but nvidia-smi is not on PATH, so the GPU architecture cannot be verified (for example, inside 'docker build', which has no GPU access). Refusing to apply patches/optional/0011-hopper-flashmla-noncausal-dspark.patch. If you are certain the build target is sm_90 (Hopper), set K3_SKIP_HOPPER_ARCH_CHECK=1 to apply it anyway." >&2
+      exit 1
+    fi
+    hopper_check_caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+      | tr -d '\r' | sort -u | tr '\n' ',')
+    hopper_check_caps=${hopper_check_caps%,}
+    if [[ "$hopper_check_caps" != "9.0" ]]; then
+      echo "K3_APPLY_OPTIONAL_HOPPER_FLASHMLA=1 but nvidia-smi reports compute capability '${hopper_check_caps:-none detected}', not the required 9.0 (sm_90 / Hopper). patches/optional/0011-hopper-flashmla-noncausal-dspark.patch is a Hopper-only wrapper and has never been validated elsewhere. Refusing to apply it. Run scripts/preflight_arch.py for the full picture, and set K3_SKIP_HOPPER_ARCH_CHECK=1 to override if you know what you are doing." >&2
+      exit 1
+    fi
+    unset hopper_check_caps
+  fi
   apply_one "$VLLM_SOURCE" \
     "$RECIPE_ROOT/patches/optional/0011-hopper-flashmla-noncausal-dspark.patch"
 fi
