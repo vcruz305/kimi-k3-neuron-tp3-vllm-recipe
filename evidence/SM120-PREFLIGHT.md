@@ -82,3 +82,69 @@ Recommended environment variables:
   repository pins base `75231eff`. Before overlaying, confirm none of the six
   patched files moved between the two commits (`git diff --name-only`), exactly
   as the README's fast-path precondition requires.
+
+## Follow-up: Path A validated end-to-end on sm_120 (measured 2026-08-09)
+
+A second session ran the full overlay path on the same 2 x RTX 5090 host.
+
+**Overlay precondition: CLEAN.** Installed image commit `f8d03e77416bf90c...`
+versus pinned base `75231eff2f3873e2...`:
+`git diff --name-only <base> <image> -- <the six patched files>` returned
+**empty**. Verified non-vacuously: all six files confirmed present at BOTH
+commits via `git cat-file -e`. The overlay is byte-identical to a clean source
+build at this image revision.
+
+**GGUF plugin install: 69 seconds** end to end (clone 1s, 4 mandatory patches
+applied with zero fuzz, `gguf==0.19.0` 1s, plugin build+install 67s).
+
+**Correction - the plugin is NOT pure Python.** Installing it compiles a real
+CUDA extension: `nvcc` builds `vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu` and
+`c++` builds `torch_bindings.cpp`, linked into `_C_gguf.abi3.so`. Crucially its
+gencode list **explicitly includes `-gencode=arch=compute_120,code=sm_120`**
+(alongside 75/80/86/89/90/100), so the plugin targets sm_120 natively rather
+than relying on PTX JIT. What IS pure Python is *this repository's patch set* -
+the patches touch zero `.cu`/`.cpp` files - which is what makes the overlay
+possible. Do not conflate the two.
+
+**Real inference on sm_120.** `Qwen/Qwen2.5-0.5B-Instruct-GGUF`
+(`q4_k_m`, 491,400,032 bytes) served through the patched vLLM + plugin, TP1.
+Server ready in 144s (torch.compile 10.84s, CUDA graph capture PIECEWISE 51/51
+and FULL 35/35). Sample, unedited:
+
+```text
+"The capital of France is"  ->  " Paris. It was founded in 787 AD by the Romans, and it has been a"
+"Q: What is 2+2?
+A:"       ->  " 4"
+```
+
+Backend selected for that (non-MLA) model, from the startup log:
+`Using FLASH_ATTN attention backend out of potential backends:
+['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION']`.
+
+**Two operational gotchas found the hard way:**
+
+1. **`--tokenizer` is mandatory.** Without it, startup dies with
+   `Unrecognized model in ...  Should have a model_type key in its config.json`
+   - a GGUF carries no HF `config.json`. This repository's `serve_dspark.sh`
+   already requires `--tokenizer`; the failure is a rediscovery of that
+   requirement, not a new gap.
+2. **`VLLM_FLASH_ATTN_VERSION` is NOT recognized by this nightly.** It logs
+   `WARNING envs.py: Unknown vLLM environment variable detected:
+   VLLM_FLASH_ATTN_VERSION`. Generation still worked (this model auto-selected
+   FlashAttention 2 anyway), but **do not rely on that env var on this build** -
+   it appears to have been renamed or removed. Verify the current knob before
+   depending on it for the MLA path.
+
+**TRITON_MLA probed live, deeper than the preflight goes.** On measured
+capability (12, 0): `TRITON_MLA.supports_compute_capability()` returns True;
+FLASH_ATTN_MLA / FLASHMLA / FLASHINFER_MLA all return False. Its MRO is a real
+chain (`TritonMLABackend -> MLACommonBackend -> AttentionBackend -> ABC`), and
+`get_impl_cls()` / `get_builder_cls()` resolve to concrete `TritonMLAImpl` /
+`TritonMLAMetadataBuilder`, not stubs.
+
+**Still untested (unchanged):** whether Kimi-K3 itself loads and serves on
+sm_120 - never attempted, 330+ GiB does not fit in 64 GiB. Kimi-K3's MLA
+dimensions are passed inside `TritonMLAImpl`'s `mla_args` bundle rather than as
+flat kwargs; the class is architected to accept arbitrary MLA configs, but K3's
+specific shapes were NOT constructed. And TRITON_MLA's numerical correctness and
+performance cost on sm_120 remain unmeasured.

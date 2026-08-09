@@ -15,7 +15,9 @@ python scripts/preflight_arch.py --json   # machine-readable, safe to paste in a
 ## Two ways to get a runnable vLLM
 
 **Path A - container overlay (minutes).** Every patch in `patches/` is pure
-Python. If a prebuilt vLLM image already carries kernels for your architecture,
+Python (the patches touch zero `.cu`/`.cpp` files). Note the GGUF *plugin*
+itself is not pure Python - installing it compiles a CUDA extension - but its
+build targets sm_120 natively and takes about 70 seconds, not hours. If a prebuilt vLLM image already carries kernels for your architecture,
 you do not need to compile vLLM at all: overlay the patched files onto the
 installed package and install the GGUF plugin.
 
@@ -68,6 +70,9 @@ Measured on real sm_120 hardware - see
 docker pull vllm/vllm-openai:nightly
 python scripts/preflight_arch.py            # expect GO-WITH-CAVEATS, TRITON_MLA
 
+# NOTE: on the nightly tested 2026-08-09, vLLM did NOT recognise this variable
+# ("Unknown vLLM environment variable detected"). Verify the current knob name
+# before relying on it. Generation worked regardless on that build.
 export VLLM_FLASH_ATTN_VERSION=2            # FA3 has no Blackwell support
 # then serve as usual, but pin the backend in the speculative config:
 #   "attention_backend": "TRITON_MLA"
