@@ -1,342 +1,298 @@
-# Kimi-K3 Neuron TP3 vLLM recipe
+# Kimi-K3 Neuron vLLM recipe
 
-Patch recipe for serving the 330.2 GB Kimi-K3 Neuron IQ1_S GGUF through
-vLLM on three H200 GPUs, with breakable CUDA graphs and an experimental
-bridge to the released Kimi-K3 DSpark speculative draft.
+Serve the compressed **Kimi-K3 Neuron IQ1_S GGUF** (330.2 GB / 307.49 GiB)
+through vLLM, with breakable CUDA graphs and a working bridge to the released
+**Kimi-K3 DSpark** speculative draft.
 
-> **DSpark status: GPU-QUALIFIED (2026-08-09).** The combined GGUF target +
-> DSpark path now constructs, serves, and clears the 1.15x promotion gate on
-> 3 x H200: **42.464 token/s** single-stream at `num_speculative_tokens: 2`,
-> **1.218x** a contemporaneous target-only baseline of 34.875 token/s.
-> Full receipt: [`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md).
->
-> **On coding workloads it reaches 52.454 token/s** at `num_speculative_tokens: 3`
-> (validated over 3 repetitions, spread 0.04%).
->
-> **Tune `num_speculative_tokens` to the workload, and never leave it at the
-> draft config's default of 7** — on this IQ1_S target N=7 is the *worst* point
-> on the curve (36.056 token/s), because speculative positions 5 and 6
-> contribute no measurable accepted tokens while still costing ~8 ms per step.
->
-> | workload | setting | result |
-> |---|---|---:|
-> | low-entropy / code | `num_speculative_tokens: 3`, capture `[1,4]` | **52.454 token/s** |
-> | high-entropy / prose | `num_speculative_tokens: 2`, capture `[1,3]` | 42.464 token/s |
->
-> **Exact token-ID parity with target-only is not achievable on this model**,
-> and that is a property of quantization, not a bug — see the correctness
-> section of the receipt before writing any equality-based test.
-
-This is a **custom source overlay**, not an official vLLM release, a forked
-wheel, or a complete vLLM fork. It pins upstream source commits and carries the
-small patch set needed for this pruned GGUF. Build from those sources or apply
-the patches to exact clean checkouts.
+This is a **source overlay**, not a vLLM fork or a wheel. It pins two upstream
+commits and carries the small patch set a pruned K3 GGUF needs.
 
 | | |
 |---|---|
-| **This recipe** | `vcruz305/kimi-k3-neuron-tp3-vllm-recipe` |
 | **GGUF** | [vcruz305/Kimi-K3-Neuron-IQ1S-GGUF](https://huggingface.co/vcruz305/Kimi-K3-Neuron-IQ1S-GGUF) |
 | **Draft** | [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark) |
-| vLLM base | `75231eff2f3873e2bce7cc9558bb5227ea70b808` |
-| GGUF plugin base | `d94067060884ea87766f12010c3a8b9c2d6715cc` |
-| Hardware qualified so far | 3 x NVIDIA H200, TP3, single sequence |
+| **vLLM base** | `75231eff2f3873e2bce7cc9558bb5227ea70b808` |
+| **GGUF plugin base** | `d94067060884ea87766f12010c3a8b9c2d6715cc` |
+| **Validated on** | sm_90 (H200). Other architectures: run the preflight |
 
-The sanitized measurement contract is preserved in
-[`evidence/TARGET-ONLY-H200.md`](evidence/TARGET-ONLY-H200.md).
+---
 
-## Measured target-only performance
+## Are you using an agent?
 
-The target-only measurements below used the same 330.2 GB / 307.49 GiB
-Neuron GGUF, TP3, BF16 compute, one sequence, and `--disable-custom-all-reduce`.
-The graph runs used capture size `[1]` only.
+Paste this into Claude Code, Cursor, or similar. It encodes the traps that cost
+real time here.
 
-| Runtime contract | Sustained decode | Status |
-|---|---:|---|
-| vLLM eager | 6.632 token/s | GPU measured |
-| vLLM PIECEWISE graph, 3 serial reps x 64 output tokens | 30.092 token/s | GPU measured |
-| vLLM PIECEWISE graph, 3 serial reps x 256 output tokens | **34.339 token/s** | GPU measured |
-| llama.cpp target-only | about 20 token/s | approximate, non-contemporaneous reference |
-| **vLLM graph + DSpark, N=2 (prose)** | **42.464 token/s** | **GPU measured 2026-08-09** |
-| **vLLM graph + DSpark, N=3 (coding)** | **52.454 token/s** | **GPU measured 2026-08-09** |
+```text
+Set up the Kimi-K3 Neuron vLLM recipe from
+https://github.com/vcruz305/kimi-k3-neuron-tp3-vllm-recipe on this machine.
 
-## Measured DSpark performance
+Do these in order and do not skip step 1.
 
-Contemporaneous target-only baseline on the same build: **34.875 token/s**
-(reproduces the published `b85de5ba…` output hash exactly).
+1. Clone the repo and run `python scripts/preflight_arch.py`. It reports my GPU
+   architecture, whether the installed torch/vLLM actually carries kernels for
+   it, and which MLA attention backends this install will accept. Do not assume
+   an answer - run it. If it reports NO-GO, stop and tell me why.
 
-| `num_speculative_tokens` | Sustained decode | vs target-only |
-|---:|---:|---:|
-| 1 | 39.113 token/s | 1.122x |
-| **2** | **42.464 token/s** | **1.218x** |
-| 3 | 41.325 token/s | 1.185x |
-| 5 | 40.028 token/s | 1.148x |
-| 7 (draft-config default) | 36.056 token/s | 1.034x |
+2. Choose a build path from its output:
+   - If a prebuilt vLLM image already carries kernels for my arch, use the
+     CONTAINER OVERLAY path (minutes). Every patch in patches/ is pure Python,
+     so they can be copied over the installed package. Verify the precondition
+     first: `git diff --name-only <image_commit> <pinned_base>` restricted to
+     the six patched files must come back EMPTY.
+   - Otherwise use scripts/build_from_source.sh (hours).
 
-Aggregate throughput, DSpark N=2: **51.352 token/s** at batch 2, **76.857
-token/s** at batch 4. Target-only reaches **88.546 token/s** at batch 8.
+3. Install the GGUF plugin at its pinned commit with the four mandatory patches
+   from patches/gguf-plugin/. Install `gguf==0.19.0` first, then the plugin with
+   --no-deps. It compiles a CUDA extension; ~70s is normal, not a hang.
 
-### Workload entropy moves the optimum
+4. Serve with scripts/serve_dspark.sh. Non-negotiable details:
+   - `--tokenizer` is MANDATORY. A GGUF has no model_type in config.json and
+     vLLM refuses to start without it.
+   - Set NUM_SPECULATIVE_TOKENS: 3 for code, 2 for prose. NEVER leave it at the
+     draft config's default of 7 - that is measurably the worst setting.
+   - Use the attention_backend the preflight recommended for my arch.
 
-The table above used a prose prompt. On coding prompts acceptance rises from
-0.547 to 0.744 and the optimum shifts from N=2 to N=3:
+5. Verify with scripts/verify_server.py (sealed France token check).
 
-| N | coding median | prose median |
-|---:|---:|---:|
-| 2 | 49.273 | **42.464** |
-| **3** | **52.454** | 41.134 |
-| 4 | 43.196 | 38.688 |
-| 5 | 45.033 | 37.345 |
-
-N=3 validated over 3 repetitions (15 measurements): 52.454 / 52.464 / 52.442,
-spread 0.022 token/s. The break-even rule predicted this from prose data —
-marginal accepted per added position on coding is +0.33 (2→3, pays), +0.20
-(3→4, at threshold), +0.16 (4→5, does not pay).
-
-**Break-even rule.** Fitted cost is `step(N) ~= 37.2 + 5.95*N` ms against a
-28.67 ms standalone decode, so speculative position *i* pays only when its
-acceptance probability exceeds `5.95 / 28.67 = 0.2075`. Measured acceptance
-crosses that threshold between positions 2 and 3, which is exactly where the
-optimum was measured. Use this rule to retune N for any other quantization.
-
-Levers that measured as **null** on this target — recorded so they are not
-repeated: the optional Hopper FlashMLA draft patch (+1.4%), `probabilistic` +
-`block` sampling (untestable at temperature 0), `--async-scheduling` (+0.02%),
-target `cudagraph_mode: FULL` (refused by the KDA backend), and symmetric-memory
-all-reduce (unavailable at world size 3).
-
-The sealed France prompt returned token ID `17374` (` Paris`) in 3/3 runs.
-A stricter five-prompt cross-engine gate matched 4/5; the fifth prompt was a
-near log-probability tie, so this repository does not claim byte-for-byte
-identity with llama.cpp on every prompt.
-
-## What the patches add
-
-- a tensor-name and transform adapter for text-only Kimi-K3 Neuron GGUF;
-- TP3-safe vocabulary padding and correct distributed fused-loader rank use;
-- BF16 dequantization for the latent routed projections used by native K3;
-- FP32 preservation for routers and AttnRes projections;
-- a CUDA grid-limit guard for top-16 MoE dispatch;
-- exact zero padding of the 64-head / 14,336-wide DSpark draft to TP3;
-- separate GGUF target and safetensors draft configuration/load paths;
-- the KimiLinear EAGLE3 auxiliary-state bridge;
-- a FULL M=7 draft graph alongside a PIECEWISE M=1/M=8 target graph.
-
-Superseded experiments `0002`, `0003`, and their `0006` reversion are
-intentionally absent. The optional Hopper FlashMLA patch is quarantined under
-[`patches/optional`](patches/optional) and is not part of the first DSpark run.
-
-Running on something other than H200? See
-[`docs/MULTI-ARCH.md`](docs/MULTI-ARCH.md) for per-architecture instructions and
-[`evidence/SM120-PREFLIGHT.md`](evidence/SM120-PREFLIGHT.md) for a measured sm_120
-capture showing the stock nightly container already carries sm_120 kernels (no
-source build required there).
-
-## Prerequisites
-
-- Linux with three H200-class GPUs visible in one host;
-- a CUDA 13.0 development stack and Python 3.12 for source builds;
-- at least 350 GB of local model storage;
-- Hugging Face access to the manually gated GGUF repository;
-- `git`, Python, and a compiler toolchain. Docker is recommended.
-
-The source build is reproducible at the Git level, but it is large. The
-target-only GPU receipt used vLLM
-`0.26.1rc1.dev511+g700d39b55` with PyTorch `2.13.0+cu130` and NCCL `2.29.7`;
-the complete toolkit and driver versions were not captured. The public patch
-base is seven commits later and does not change the relevant K3/DSpark files.
-Clean patch application, source contracts, and the integrated DSpark GPU run
-are all validated at the public base -- see
-[`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md).
-
-## Before you build
-
-This recipe was built and GPU-measured on exactly one architecture. Before
-spending GPU time, a Hugging Face download, or a multi-hour source build,
-run the no-hardware-damage preflight check:
-
-```bash
-python3 scripts/preflight_arch.py
+Rules:
+- Do NOT write a test requiring speculative output to match non-speculative
+  output token-for-token. That is impossible on a quantized target by
+  construction - see evidence/DSPARK-TP3-H200.md.
+- Do NOT quote this repo's sm_90 performance numbers for any other
+  architecture.
+- Report what you actually measured, not what the docs claim. If a step fails,
+  give me the real error text.
 ```
 
-It reports each visible GPU's compute capability and whether the installed
-torch build actually carries kernels for it (native cubin, PTX JIT, or
-neither); enumerates which of the four MLA attention backends this recipe
-cares about (`FLASH_ATTN_MLA`, `FLASHMLA`, `FLASHINFER_MLA`, `TRITON_MLA`)
-are importable and self-report support for that capability by asking vLLM's
-own backend registry, rather than assuming from a table; and prints a
-GO / GO-WITH-CAVEATS / NO-GO verdict with a recommended `attention_backend`
-and environment variables for what it found. It exits non-zero on NO-GO, so
-it can gate a build script. Add `--json` for a report intended to be safe to
-paste into a bug report (no tokens, no absolute filesystem paths, no model
-files). Read the compatibility matrix below either way.
+---
 
-**Container fast-path.** If a prebuilt vLLM image already carries kernels
-for your architecture, this recipe's patches are pure Python and can be
-overlaid onto that image's site-packages instead of a multi-hour source
-build -- this is what the H200/sm_90 run actually did (patched Python
-overlaid onto `vllm/vllm-openai:nightly`, which happened to match
-`pins.env` exactly) and it saved roughly an hour versus building from
-source. The precondition is that the image's installed vLLM commit is
-close to this recipe's pinned base; if it has drifted, the patches may not
-apply cleanly and a source build is the safer path. There is no equivalent
-prebuilt image for sm_121 (aarch64) today -- see the matrix below.
+## Start here: which GPU do you have?
 
-## Compatibility matrix
+Run this first. It probes your actual install rather than trusting any table,
+including the one below.
 
-| Architecture | Example GPU | Status | Known blockers | Recommended backend |
+```bash
+python scripts/preflight_arch.py          # exits non-zero on NO-GO
+python scripts/preflight_arch.py --json   # safe to paste into a bug report
+```
+
+| Your GPU | arch | Build path | Attention backend | Status |
 |---|---|---|---|---|
-| sm_90 | H100 / H200 | **VALIDATED (GPU-measured)** | none | `TRITON_MLA` for the first correctness run (see [`docs/INTEGRATED-RUNBOOK.md`](docs/INTEGRATED-RUNBOOK.md)); `FLASH_ATTN_MLA` and `FLASHMLA` also self-report support in this vLLM pin. Optional patch [`0011`](patches/optional/0011-hopper-flashmla-noncausal-dspark.patch) applies here, and only here. |
-| sm_120 | RTX PRO 6000 (Blackwell workstation) | UNTESTED, known risk | Open upstream: [vLLM does not support DeepSeek-series models on RTX PRO 6000 / SM120](https://github.com/vllm-project/vllm/issues/26211) -- Kimi-K3 is DeepSeek-lineage MLA, so this plausibly applies. `FLASHMLA` is Hopper/Blackwell-datacenter only in this pin (`capability.major in [9, 10]`) and is not offered. Needs `VLLM_FLASH_ATTN_VERSION=2` (FA3 has no Blackwell support here). | `TRITON_MLA` (arch-agnostic fallback: its capability check always returns true in this pin). The plain `FLASHINFER_MLA` backend self-reports support for `capability.major == 10` only (Blackwell *datacenter*) in this vLLM pin -- do not assume it covers sm_120 without checking `preflight_arch.py`'s live output. A separate `FLASHINFER_MLA_SPARSE_SM120` backend exists in the pinned vLLM tree and targets sm_120 by name, but belongs to the sparse-MLA family used by different (indexer-based) models; this recipe's patches do not wire Kimi-K3 into that path. |
-| sm_121 | NVIDIA DGX Spark (GB10), aarch64 | UNTESTED, two extra blockers | Open upstream: [no sm_121 (Blackwell) support on aarch64](https://github.com/vllm-project/vllm/issues/36821). Stock PyTorch ships native kernels only through sm_120, so aarch64 needs either the `+PTX` JIT path (see [`scripts/build_from_source.sh`](scripts/build_from_source.sh)) or a full from-source build. Separately, memory: [`docs/DGX-SPARK-PORT.md`](docs/DGX-SPARK-PORT.md) measured 84.06 GiB/rank at TP4 for the 307.49 GiB model, so 4 Sparks, not 3; a larger, in-progress ~353.71 GiB IQ2-class build would scale that to roughly 88 GiB/rank at TP4 and would not fit 3 Sparks either. | `TRITON_MLA` (arch-agnostic fallback, same reasoning as sm_120). Needs `VLLM_FLASH_ATTN_VERSION=2`. |
-| sm_80 | A100 | UNTESTED | None specific to it -- it is exactly as unvalidated as sm_120 or sm_121, it has just attracted less attention because it raises no known upstream blocker. This gap is not Blackwell-specific. | `TRITON_MLA` (arch-agnostic fallback); `FLASH_ATTN_MLA` and `FLASHMLA` are not expected (both gate on major 9 or 9/10). |
+| **H200, H100** | sm_90 | overlay or source | `FLASH_ATTN_MLA` | **validated** |
+| **B200, GB200** | sm_100 | overlay | `FLASHINFER_MLA` | untested |
+| **RTX PRO 6000, RTX 5090** | sm_120 | overlay (verified) | `TRITON_MLA` only | environment verified |
+| **DGX Spark (GB10)** | sm_121 | source, aarch64 | `TRITON_MLA` only | untested |
+| **A100** | sm_80 | overlay | `TRITON_MLA` | untested |
 
-Run `scripts/preflight_arch.py` for the authoritative, live answer against
-your actual install -- this table is prior knowledge, not a substitute for
-it, and vLLM's own backend capability gates can change between pins.
+Per-architecture detail, including the sm_120 and sm_121 caveats:
+[`docs/MULTI-ARCH.md`](docs/MULTI-ARCH.md).
 
-## 1. Download pinned assets
+---
 
-Authenticate without putting a token in a command, shell history, or this
-repository:
+## How to: get a runnable vLLM
+
+### Option A - container overlay (minutes, preferred)
+
+Every patch in `patches/` is pure Python. If a prebuilt image already carries
+kernels for your architecture, you do not need to compile vLLM at all - copy the
+patched files over the installed package.
+
+**Verify the precondition first.** The image's vLLM commit must be close enough
+to the pinned base that none of the patched files moved:
+
+```bash
+git -C /path/to/vllm diff --name-only <image_commit> 75231eff2f3873e2bce7cc9558bb5227ea70b808 \
+  -- vllm/config/speculative.py vllm/model_executor/models/utils.py \
+     vllm/models/kimi_k3/nvidia/dspark_mla.py vllm/models/kimi_k3/nvidia/model.py \
+     vllm/v1/worker/gpu/spec_decode/dflash/speculator.py \
+     vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+```
+
+Empty output means the overlay is byte-identical to a clean source build.
+Measured: this saved about an hour on sm_90, and on sm_120 the drift was zero.
+
+The GGUF **plugin** is not pure Python - installing it compiles a CUDA
+extension - but that takes about 70 seconds and its build targets sm_120
+natively.
+
+### Option B - source build (hours)
+
+Needed when no prebuilt image carries your architecture.
+
+```bash
+./scripts/check_bundle.py
+./scripts/prepare_sources.sh /opt/k3-sources
+MAX_JOBS=16 ./scripts/build_from_source.sh /opt/k3-sources
+./scripts/assert_runtime.py
+```
+
+`TORCH_CUDA_ARCH_LIST` defaults to `"9.0;12.0+PTX"`. The `+PTX` embeds
+`compute_120` PTX that JITs forward onto sm_121 (DGX Spark), so one build can
+serve sm_90, sm_120 and sm_121. Cost: a one-time JIT delay on first load.
+
+---
+
+## How to: download the pinned assets
 
 ```bash
 hf auth login
 ./scripts/download_assets.sh /models/k3-neuron /models/k3-tokenizer /models/k3-dspark
 ```
 
-The tokenizer executes pinned Moonshot tokenizer code. It is downloaded from
-the immutable revision in `pins.env`, checked against the hashes in
-`TOKENIZER-SHA256SUMS`, and then loaded from the local directory with
-`--trust-remote-code`. Review those four small files before use if your threat
-model requires it. A static audit of the pinned files found no subprocess,
-shell, network, dynamic-evaluation, deletion, or arbitrary-write path; the only
-write helper is the normal vocabulary-save copy operation.
+The tokenizer executes pinned Moonshot code. It is fetched at the immutable
+revision in `pins.env`, checked against `TOKENIZER-SHA256SUMS`, then loaded from
+the local directory with `--trust-remote-code`.
 
-## 2. Build the pinned overlay
+---
 
-### Docker
-
-The Dockerfile performs a full source build; it does not depend on a moving
-`nightly` image:
+## How to: serve it
 
 ```bash
-docker build --build-arg MAX_JOBS=16 -t k3-neuron-vllm:tp3 .
-```
-
-Run target-only with host networking so the server's in-container loopback bind
-remains loopback-only. Mount all downloaded artifacts read-only:
-
-```bash
-docker run --rm \
-  --gpus all \
-  --ipc=host \
-  --shm-size=32g \
-  --network=host \
-  -v /models/k3-neuron:/models/k3-neuron:ro \
-  -v /models/k3-tokenizer:/models/k3-tokenizer:ro \
-  -e TARGET_GGUF=/models/k3-neuron/k3-neuron-iq1s-00001-of-00009.gguf \
-  -e TARGET_TOKENIZER=/models/k3-tokenizer \
-  k3-neuron-vllm:tp3 \
-  /opt/recipe/scripts/serve_target.sh
-```
-
-If you deliberately bind to a non-loopback interface, the launchers fail
-closed unless `VLLM_API_KEY` is set or the explicit insecure-network
-acknowledgement is supplied. Be aware that a CLI API key can be visible to
-other users on the same host through process inspection.
-
-### Existing CUDA environment
-
-Run this inside an isolated CUDA build environment:
-
-```bash
-./scripts/prepare_sources.sh /opt/k3-sources
-MAX_JOBS=16 ./scripts/build_from_source.sh /opt/k3-sources
-./scripts/assert_runtime.py
-```
-
-The plugin install uses `--no-deps` so it cannot silently replace the runtime's
-PyTorch/NCCL packages. See [`APPLY.md`](APPLY.md) for the exact order and
-manual path.
-
-## 3. Run target-only first
-
-The server binds only to loopback by default. Do not expose an unauthenticated
-vLLM endpoint to a public network.
-
-```bash
-export TARGET_GGUF=/models/k3-neuron/k3-neuron-iq1s-00001-of-00009.gguf
-export TARGET_TOKENIZER=/models/k3-tokenizer
-./scripts/serve_target.sh
-```
-
-In another shell:
-
-```bash
-./scripts/verify_server.py --model k3-neuron
-./scripts/benchmark_server.py \
-  --model k3-neuron \
-  --chat-template /models/k3-neuron/k3_chat_template.jinja \
-  --tokens 256 \
-  --repetitions 3
-```
-
-The benchmark reproduces the exact published photosynthesis contract: shipped
-template, maximum thinking effort, 105 rendered prompt tokens, temperature
-zero, and fixed 64- or 256-token output. It reports HTTP-observed rates; it is
-not a substitute for an engine profiler.
-
-## 4. Qualify DSpark
-
-Read [`docs/INTEGRATED-RUNBOOK.md`](docs/INTEGRATED-RUNBOOK.md) before spending
-GPU time. The first run uses `TRITON_MLA`, greedy drafting, and standard
-rejection so target token preservation can be checked before optimizing
-sampling.
-
-```bash
-export TARGET_GGUF=/models/k3-neuron/k3-neuron-iq1s-00001-of-00009.gguf
-export TARGET_TOKENIZER=/models/k3-tokenizer
-export DRAFT_MODEL=/models/k3-dspark
-export K3_ACK_DSPARK_UNVERIFIED=1
+K3_ACK_DSPARK_UNVERIFIED=1 \
+TARGET_GGUF=/models/k3-neuron/k3-neuron-iq1s-00001-of-00009.gguf \
+TARGET_TOKENIZER=/models/k3-tokenizer \
+DRAFT_MODEL=/models/k3-dspark \
+NUM_SPECULATIVE_TOKENS=3 CUDAGRAPH_CAPTURE_SIZES='[1,4]' \
 ./scripts/serve_dspark.sh
 ```
 
-Promotion requires exact target-token preservation on the fixed prompt suite,
-at least 1.15x the contemporaneous target-only median, a bootstrap lower bound
-above 1.00x, at least 1 GiB HBM free per rank after graph capture, and no ECC,
-OOM, graph fallback, or draft-loader errors.
+Three things that will bite you otherwise:
+
+1. **`--tokenizer` is mandatory.** A GGUF carries no HF `config.json`, so vLLM
+   fails with `Unrecognized model ... should have a model_type key`.
+2. **Set `num_speculative_tokens` yourself** (next section). The draft config's
+   default of 7 is the worst point on the curve.
+3. **Pick the backend for your architecture** from the preflight.
+   `FLASH_ATTN_MLA` is sm_90 only; most others get `TRITON_MLA`.
+
+Target-only, without the draft:
+
+```bash
+TARGET_GGUF=... TARGET_TOKENIZER=... ./scripts/serve_target.sh
+```
+
+Then verify:
+
+```bash
+python scripts/verify_server.py --model k3-neuron-dspark
+```
+
+---
+
+## How to: choose `num_speculative_tokens`
+
+**Highest-impact setting in the whole recipe, and the default is wrong.**
+Measured on sm_90, single stream, 256-token contract, temperature 0:
+
+| workload | setting | capture sizes | result |
+|---|---|---|---:|
+| **low-entropy / code** | `3` | `[1,4]` | **52.454 token/s** |
+| **high-entropy / prose** | `2` | `[1,3]` | **42.464 token/s** |
+| draft-config default | `7` | `[1,8]` | 36.056 token/s (worst) |
+
+Why: one extra speculative token costs ~5.95 ms against a 28.67 ms decode, so
+position *i* only pays when its acceptance probability exceeds
+`5.95 / 28.67 = 0.2075`. Measured acceptance crosses that between positions 2
+and 3. At N=5 and N=7 the model emits an **identical** 2.844 tokens/step -
+positions 5 and 6 contribute nothing while still costing ~8 ms.
+
+Reuse that break-even rule to retune for any other quantization.
+
+---
+
+## Measured results (sm_90 only)
+
+3 x H200, TP3, one sequence, `--disable-custom-all-reduce`.
+**Do not quote these for another architecture.**
+
+| Runtime | Sustained decode |
+|---|---:|
+| vLLM eager | 6.632 token/s |
+| vLLM PIECEWISE graph, target only | 34.875 token/s |
+| **+ DSpark, N=2 (prose)** | **42.464 token/s** |
+| **+ DSpark, N=3 (coding)** | **52.454 token/s** |
+| llama.cpp target-only (non-contemporaneous) | ~20 token/s |
+
+Aggregate throughput: 51.4 token/s at batch 2 and 76.9 at batch 4 with DSpark;
+88.5 token/s at batch 8 target-only.
+
+Receipts: [`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md) -
+[`evidence/TARGET-ONLY-H200.md`](evidence/TARGET-ONLY-H200.md) -
+[`evidence/SM120-PREFLIGHT.md`](evidence/SM120-PREFLIGHT.md)
+
+### One correctness property you must know
+
+**Speculative output will not match non-speculative output token-for-token, and
+that is not a bug.** Over the first 60 positions the median top-1/top-2 logprob
+gap is 1.875 nats, but 5% of positions sit within 0.125 nats and at least one is
+an exact tie. Any numerical difference between the M=1 decode path and the
+M=N+1 verify path flips one of them, and GGUF dispatches small-M work to a
+different kernel path, so such a difference exists by construction.
+
+Use the sealed France single-token check (token `17374`, holds 3/3 in every
+configuration) plus run-to-run determinism instead. **Do not write an
+equality-based parity test.**
+
+---
+
+## What the patches do
+
+- tensor-name and transform adapter for the text-only Kimi-K3 Neuron GGUF
+- TP3-safe vocabulary padding and correct distributed fused-loader rank use
+- BF16 dequantization for the latent routed projections native K3 needs
+- FP32 preservation for routers and AttnRes projections
+- a CUDA grid-limit guard for top-16 MoE dispatch
+- exact zero padding of the 64-head / 14,336-wide DSpark draft to TP3
+- separate GGUF target and safetensors draft configuration/load paths
+- the KimiLinear EAGLE3 auxiliary-state bridge
+- an independent FULL draft graph alongside a PIECEWISE target graph
+
+Superseded experiments `0002`, `0003` and their `0006` reversion are
+intentionally absent. The Hopper FlashMLA patch is quarantined in
+[`patches/optional`](patches/optional), and `apply_patches.sh` refuses to apply
+it off sm_90.
+
+---
 
 ## Repository map
 
 | Path | Purpose |
 |---|---|
-| [`APPLY.md`](APPLY.md) | exact clone, patch, install, and assertion sequence |
+| [`scripts/preflight_arch.py`](scripts) | **run first** - architecture and backend probe |
+| [`scripts/serve_dspark.sh`](scripts) | serve target + DSpark draft |
+| [`scripts/serve_target.sh`](scripts) | serve target only |
+| [`scripts/verify_server.py`](scripts) | sealed France token check |
+| [`APPLY.md`](APPLY.md) | exact clone, patch, install and assertion sequence |
+| [`docs/MULTI-ARCH.md`](docs/MULTI-ARCH.md) | per-architecture instructions |
+| [`docs/INTEGRATED-RUNBOOK.md`](docs/INTEGRATED-RUNBOOK.md) | operator runbook, gates, rollback |
+| [`docs/DGX-SPARK-PORT.md`](docs/DGX-SPARK-PORT.md) | Spark feasibility study |
+| [`evidence`](evidence) | sanitized measurement receipts |
+| [`patches`](patches) | the mandatory patch chain |
 | [`config`](config) | text-only pruned Kimi-K3 configuration |
-| [`patches/gguf-plugin`](patches/gguf-plugin) | mandatory GGUF plugin patches |
-| [`patches/vllm`](patches/vllm) | mandatory vLLM, graph, and DSpark patches |
-| [`patches/optional`](patches/optional) | unqualified Hopper FlashMLA experiment |
-| [`scripts`](scripts) | build, launch, integrity, parity, and benchmark tools |
 | [`tests`](tests) | hermetic source-contract checks |
-| [`docs/INTEGRATED-RUNBOOK.md`](docs/INTEGRATED-RUNBOOK.md) | paid-run gates and rollback rules |
+
+---
 
 ## Non-claims
 
-- This is not upstream vLLM support or an official vLLM image.
-- DSpark speed, acceptance, and graph replay are GPU-measured on 3 x H200
-  (see [`evidence/DSPARK-TP3-H200.md`](evidence/DSPARK-TP3-H200.md)), but not
-  on any other architecture -- see the compatibility matrix.
-- The 34.339 token/s figure used target capture `[1]` only; the qualified
-  DSpark path separately measured target capture `[1,3]` (prose, N=2) and
-  `[1,4]` (coding, N=3).
-- Native K3 MXFP4/GB300 throughput does not transfer directly to IQ1_S/TP3
-  H200.
-- This recipe does not redistribute weights, draft weights, or tokenizer
-  artifacts.
+- Validated on **sm_90 only**. Every other architecture is untested; the
+  preflight tells you the truth for your own box.
+- **`TRITON_MLA` performance is unmeasured.** Every number here used
+  `FLASH_ATTN_MLA`, which only sm_90 accepts. Most other architectures fall
+  back to Triton and the cost is unknown.
+- Upstream [vLLM #26211](https://github.com/vllm-project/vllm/issues/26211)
+  reports DeepSeek-series failures on sm_120. Kimi-K3 is DeepSeek-lineage MLA,
+  so it plausibly applies there.
+- The 34.339 token/s figure used target capture `[1]` only; the qualified DSpark
+  path separately measured `[1,3]` (prose, N=2) and `[1,4]` (coding, N=3).
+- Native K3 MXFP4/GB300 throughput does not transfer to IQ1_S on TP3.
+- This is not upstream vLLM support or an official vLLM image, and it
+  redistributes no weights, draft weights, or tokenizer artifacts.
 
 ## License and attribution
 
-Original recipe scripts, documentation, and patch contributions are provided
+Original recipe scripts, documentation and patch contributions are provided
 under Apache-2.0. `config/config.json` is model-derived metadata and remains
 subject to the applicable Kimi/model terms. Upstream projects and model
-artifacts retain their own terms. See [`NOTICE`](NOTICE) and
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+artifacts retain their own terms. See [`LICENSE`](LICENSE), [`NOTICE`](NOTICE)
+and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
