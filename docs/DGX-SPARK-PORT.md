@@ -1,5 +1,15 @@
 # Porting this recipe to a DGX Spark cluster
 
+> **Superseded.** This document is the pre-validation feasibility study
+> (Phase 0 only — estimates, not measurements) that preceded actual work on
+> DGX Spark hardware. That work is done: a non-speculative TP4 configuration
+> across 4 physical Sparks was fully debugged and validated (four real
+> vLLM/GGUF-plugin bugs found and fixed, correct output confirmed) in
+> [**kimi-k3-neuron-tp4-vllm-recipe**](https://github.com/vcruz305/kimi-k3-neuron-tp4-vllm-recipe).
+> Note that repo does **not** carry the DSpark speculative draft this recipe
+> uses — it's a plain non-speculative serve. Use it for the actual Spark
+> deployment; treat everything below as historical planning context only.
+
 Feasibility study and phased plan for running the Kimi-K3 Neuron IQ1_S GGUF on
 NVIDIA DGX Spark (GB10) nodes under vLLM, with the DSpark speculative draft.
 

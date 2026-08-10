@@ -93,7 +93,14 @@ Two risks to keep in view:
 family that `FLASHINFER_MLA` accepts (`major == 10`). If you have a choice of
 Blackwell hardware, this is the one likely to avoid the Triton fallback.
 
-## sm_121 - DGX Spark GB10 (UNTESTED, two extra blockers)
+## sm_121 - DGX Spark GB10 (UNTESTED here, two extra blockers)
+
+> This recipe (TP3 + DSpark speculative decoding) remains untested on Spark.
+> A separate, non-speculative TP4 configuration across 4 physical Sparks
+> **is** validated, with four real vLLM/GGUF-plugin bugs found and fixed —
+> see [kimi-k3-neuron-tp4-vllm-recipe](https://github.com/vcruz305/kimi-k3-neuron-tp4-vllm-recipe).
+> The two blockers below (aarch64, memory) are exactly what that repo had to
+> solve; its `docs/BUGS.md` has the actual fixes rather than estimates.
 
 1. **aarch64.** Spark is ARM. Stock PyTorch ships CUDA kernels only through
    sm_120, and aarch64 wheel availability is the practical constraint - see

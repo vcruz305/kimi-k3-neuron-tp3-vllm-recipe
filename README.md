@@ -81,11 +81,20 @@ python scripts/preflight_arch.py --json   # safe to paste into a bug report
 | **H200, H100** | sm_90 | overlay or source | `FLASH_ATTN_MLA` | **validated** |
 | **B200, GB200** | sm_100 | overlay | `FLASHINFER_MLA` | untested |
 | **RTX PRO 6000, RTX 5090** | sm_120 | overlay (verified) | `TRITON_MLA` only | environment verified |
-| **DGX Spark (GB10)** | sm_121 | source, aarch64 | `TRITON_MLA` only | untested |
+| **DGX Spark (GB10)** | sm_121 | source, aarch64 | `TRITON_MLA` only | untested *(for this TP3+DSpark recipe)* |
 | **A100** | sm_80 | overlay | `TRITON_MLA` | untested |
 
 Per-architecture detail, including the sm_120 and sm_121 caveats:
 [`docs/MULTI-ARCH.md`](docs/MULTI-ARCH.md).
+
+**Looking for a validated 4x DGX Spark recipe?** This repo's DGX Spark row is
+about the single-node, TP3+DSpark configuration above, which has not been run
+on Spark hardware. A *separate*, non-speculative TP4 configuration across 4
+physical Sparks was fully debugged and validated (four real vLLM/GGUF-plugin
+bugs found and fixed) in
+[`kimi-k3-neuron-tp4-vllm-recipe`](https://github.com/vcruz305/kimi-k3-neuron-tp4-vllm-recipe).
+`docs/DGX-SPARK-PORT.md` in this repo is the pre-validation feasibility study
+that preceded that work; the TP4 repo is what actually ships and runs.
 
 ---
 
@@ -265,7 +274,7 @@ it off sm_90.
 | [`APPLY.md`](APPLY.md) | exact clone, patch, install and assertion sequence |
 | [`docs/MULTI-ARCH.md`](docs/MULTI-ARCH.md) | per-architecture instructions |
 | [`docs/INTEGRATED-RUNBOOK.md`](docs/INTEGRATED-RUNBOOK.md) | operator runbook, gates, rollback |
-| [`docs/DGX-SPARK-PORT.md`](docs/DGX-SPARK-PORT.md) | Spark feasibility study |
+| [`docs/DGX-SPARK-PORT.md`](docs/DGX-SPARK-PORT.md) | Spark feasibility study (superseded — see [kimi-k3-neuron-tp4-vllm-recipe](https://github.com/vcruz305/kimi-k3-neuron-tp4-vllm-recipe) for the validated recipe) |
 | [`evidence`](evidence) | sanitized measurement receipts |
 | [`patches`](patches) | the mandatory patch chain |
 | [`config`](config) | text-only pruned Kimi-K3 configuration |
